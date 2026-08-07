@@ -1,0 +1,7 @@
+const DEFAULT_SHIFT_START = '10:00 AM';
+const DEFAULT_SHIFT_END = '07:00 PM';
+
+module.exports = {
+  DEFAULT_SHIFT_START,
+  DEFAULT_SHIFT_END,
+};

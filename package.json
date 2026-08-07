@@ -1,0 +1,31 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "HR Core REST API — Express + MongoDB backend for HR Management mobile app",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "seed": "node utils/seed.js",
+    "seed:team": "node utils/seedTeam.js",
+    "migrate:org": "node utils/migrateOrg.js",
+    "migrate:dept-links": "node utils/migrateDeptLinks.js",
+    "migrate:seed-teams": "node utils/migrateSeedTeams.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "colors": "^1.4.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.7.2",
+    "morgan": "^1.11.0",
+    "multer": "^2.2.0"
+  }
+}
