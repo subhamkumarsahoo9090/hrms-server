@@ -71,9 +71,13 @@ function sanitizeUser(user) {
   const obj = user.toObject ? user.toObject() : { ...user };
   delete obj.password;
   delete obj.__v;
+  const mongoId = obj._id != null ? String(obj._id) : null;
   return {
-    id: obj.employeeId,
-    _id: obj._id,
+    /** Display / HR code (EMP005) — kept as `id` for mobile app compatibility */
+    id: obj.employeeId || mongoId,
+    employeeId: obj.employeeId || null,
+    /** MongoDB ObjectId string — use this for API path params that expect ObjectId */
+    _id: mongoId,
     name: obj.name,
     role: obj.role,
     systemRole: obj.systemRole,
@@ -82,15 +86,19 @@ function sanitizeUser(user) {
     avatar: resolveAvatar(obj.avatar, obj.name),
     delayCount: obj.delayCount,
     salary: obj.salary,
+    phone: obj.phone || '',
     email: obj.email,
     shiftStart: obj.shiftStart || DEFAULT_SHIFT_START,
     shiftEnd: obj.shiftEnd || DEFAULT_SHIFT_END,
     isActive: obj.isActive !== false,
     lastLoginAt: obj.lastLoginAt ? new Date(obj.lastLoginAt).toISOString() : null,
+    createdAt: obj.createdAt ? new Date(obj.createdAt).toISOString() : null,
+    updatedAt: obj.updatedAt ? new Date(obj.updatedAt).toISOString() : null,
     companyId: obj.companyId ? String(obj.companyId) : null,
     branchId: obj.branchId ? String(obj.branchId) : null,
     departmentId: obj.departmentId ? String(obj.departmentId) : null,
     teamId: obj.teamId ? String(obj.teamId) : null,
+    teamIds: Array.isArray(obj.teamIds) ? obj.teamIds.map((id) => String(id)) : [],
     managerId: obj.managerId ? String(obj.managerId) : null,
   };
 }

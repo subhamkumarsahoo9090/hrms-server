@@ -150,6 +150,7 @@ async function migrate() {
 
       for (const user of group) {
         user.teamId = team._id;
+        user.teamIds = [team._id];
         if (manager && String(user._id) !== String(manager._id)) {
           user.managerId = manager._id;
         }

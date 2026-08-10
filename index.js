@@ -26,6 +26,12 @@ const dashboardRoutes = require('./routes/dashboard');
 const analyticsRoutes = require('./routes/analytics');
 const chatRoutes = require('./routes/chat');
 const notificationRoutes = require('./routes/notifications');
+const performanceRoutes = require('./routes/performance');
+const onboardingRoutes = require('./routes/onboarding');
+const documentsRoutes = require('./routes/documents');
+const taskRoutes = require('./routes/tasks');
+const auditRoutes = require('./routes/audit');
+const holidayRoutes = require('./routes/holidays');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -66,6 +72,12 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/audit-logs', auditRoutes);
+app.use('/api/performance', performanceRoutes);
+app.use('/api/onboarding', onboardingRoutes);
+app.use('/api/documents', documentsRoutes);
+app.use('/api/tasks', taskRoutes);
+app.use('/api/holidays', holidayRoutes);
 
 app.use((_req, res) => {
   res.status(404).json({ success: false, message: 'Route not found' });

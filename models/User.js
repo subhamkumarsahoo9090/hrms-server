@@ -33,10 +33,17 @@ const userSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+    /** Primary / home team (backwards compatible) */
     teamId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Team',
       default: null,
+      index: true,
+    },
+    /** All teams this user belongs to (multi-team) */
+    teamIds: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Team' }],
+      default: [],
       index: true,
     },
     managerId: {
@@ -50,6 +57,7 @@ const userSchema = new mongoose.Schema(
     lastLoginAt: { type: Date, default: null },
     delayCount: { type: Number, default: 0 },
     salary: { type: Number, default: 0 },
+    phone: { type: String, default: '', trim: true },
     shiftStart: { type: String, default: DEFAULT_SHIFT_START },
     shiftEnd: { type: String, default: DEFAULT_SHIFT_END },
     customRoleId: { type: mongoose.Schema.Types.ObjectId, ref: 'CustomRole', default: null },

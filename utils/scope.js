@@ -36,6 +36,13 @@ function buildUserScopeFilter(actor) {
     const or = [{ _id: actor._id }];
     if (actor.teamId) {
       or.push({ teamId: actor.teamId });
+      or.push({ teamIds: actor.teamId });
+    }
+    if (Array.isArray(actor.teamIds)) {
+      for (const tid of actor.teamIds) {
+        or.push({ teamId: tid });
+        or.push({ teamIds: tid });
+      }
     }
     or.push({ managerId: actor._id });
     return { ...base, $or: or };
@@ -95,8 +102,12 @@ function canAccessEmployee(actor, target) {
 
   if (isTeamScopedRole(actor.systemRole)) {
     if (String(actor._id) === String(target._id)) return true;
-    if (actor.teamId && target.teamId && String(actor.teamId) === String(target.teamId)) {
-      return true;
+    const actorTeams = new Set();
+    if (actor.teamId) actorTeams.add(String(actor.teamId));
+    for (const tid of actor.teamIds || []) actorTeams.add(String(tid));
+    if (target.teamId && actorTeams.has(String(target.teamId))) return true;
+    for (const tid of target.teamIds || []) {
+      if (actorTeams.has(String(tid))) return true;
     }
     return target.managerId && String(target.managerId) === String(actor._id);
   }

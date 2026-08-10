@@ -7,10 +7,13 @@
     "start": "node index.js",
     "dev": "node --watch index.js",
     "seed": "node utils/seed.js",
+    "seed:salaries": "node utils/seedSalaries.js",
+    "seed:tasks": "node utils/seedTasks.js",
     "seed:team": "node utils/seedTeam.js",
     "migrate:org": "node utils/migrateOrg.js",
     "migrate:dept-links": "node utils/migrateDeptLinks.js",
     "migrate:seed-teams": "node utils/migrateSeedTeams.js",
+    "migrate:team-ids": "node utils/migrateTeamIds.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

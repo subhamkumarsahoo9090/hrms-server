@@ -5,23 +5,32 @@ const User = require('../models/User');
 const Company = require('../models/Company');
 const CompanyMembership = require('../models/CompanyMembership');
 const Branch = require('../models/Branch');
+const Team = require('../models/Team');
 const { protect } = require('../middleware/auth');
 const { authorize } = require('../middleware/authorize');
-const { isBranchScopedRole } = require('../constants/permissions');
+const {
+  isBranchScopedRole,
+  isTeamScopedRole,
+  hasPermission,
+} = require('../constants/permissions');
 const { toObjectId } = require('../utils/scope');
 const {
   sendSuccess,
   sendError,
   formatTime,
   formatDate,
+  formatBreakDuration,
   resolveAvatar,
 } = require('../utils/helpers');
 const { DEFAULT_SHIFT_START, DEFAULT_SHIFT_END } = require('../constants/shifts');
 const { isLateCheckIn } = require('../utils/shiftTime');
 const {
   ACTIVE_EMPLOYEE_FILTER,
+  ATTENDANCE_SCOPE_FILTER,
   getTodayAbsentUsers,
 } = require('../utils/absences');
+const { getUserTeamIdList } = require('../utils/teamMembership');
+const { computeBreakState } = require('../utils/breaks');
 
 const router = express.Router();
 
@@ -62,17 +71,124 @@ function mapAttendance(log) {
   };
 }
 
-function mapBreakSummary(log) {
+function mapBreakSummary(log, date = formatDate()) {
   if (!log) return null;
+  const state = computeBreakState(log, date || log.date || formatDate());
   return {
     startTime: log.startTime || '',
     endTime: log.endTime || '',
-    duration: log.duration || '',
-    status: log.status,
+    duration: log.duration || formatBreakDuration(state.usedSeconds),
+    status: state.breakStatus,
+    usedSeconds: state.usedSeconds,
+    remainingSeconds: state.remainingSeconds,
+    allowanceSeconds: state.allowanceSeconds,
+    usedLabel: formatBreakDuration(state.usedSeconds),
+    remainingLabel: formatBreakDuration(state.remainingSeconds),
+    sessions: (log.sessions || []).map((s) => ({
+      startTime: s.startTime,
+      endTime: s.endTime,
+      durationSeconds: s.durationSeconds,
+      duration: formatBreakDuration(s.durationSeconds || 0),
+    })),
   };
 }
 
+function attendanceScopeMeta(user) {
+  const canViewStaff = hasPermission(user.systemRole, 'view_all_attendance');
+  switch (user.systemRole) {
+    case 'company_owner':
+      return {
+        scope: 'company',
+        scopeLabel: 'All owned companies',
+        isSelfService: false,
+        canViewStaff: true,
+      };
+    case 'super_admin':
+      return {
+        scope: 'company',
+        scopeLabel: 'Company-wide',
+        isSelfService: false,
+        canViewStaff: true,
+      };
+    case 'branch_head':
+      return {
+        scope: 'branch',
+        scopeLabel: 'Your branch',
+        isSelfService: false,
+        canViewStaff: true,
+      };
+    case 'hr':
+      return {
+        scope: 'branch',
+        scopeLabel: 'Your branch (HR)',
+        isSelfService: false,
+        canViewStaff: true,
+      };
+    case 'manager':
+      return {
+        scope: 'team',
+        scopeLabel: 'Your team',
+        isSelfService: false,
+        canViewStaff: true,
+      };
+    default:
+      return {
+        scope: 'self',
+        scopeLabel: 'Personal',
+        isSelfService: true,
+        canViewStaff: false,
+      };
+  }
+}
+
+async function resolveScopedEmployeeFilter(user) {
+  // Employees / staff — only themselves
+  if (!hasPermission(user.systemRole, 'view_all_attendance')) {
+    return { ...ATTENDANCE_SCOPE_FILTER, _id: user._id };
+  }
+
+  const companyIds = await resolveCompanyIds(user);
+  const filter = { ...ATTENDANCE_SCOPE_FILTER };
+
+  if (companyIds.length) {
+    filter.companyId = {
+      $in: companyIds.map((id) => toObjectId(id)).filter(Boolean),
+    };
+  }
+
+  if (isBranchScopedRole(user.systemRole) && user.branchId) {
+    filter.branchId = user.branchId;
+  }
+
+  if (user.systemRole === 'manager' || isTeamScopedRole(user.systemRole)) {
+    const teamIds = getUserTeamIdList(user);
+    const managed = await Team.find({
+      managerId: user._id,
+      ...(user.companyId ? { companyId: user.companyId } : {}),
+    }).select('_id');
+    const allTeamIds = [
+      ...new Set([...teamIds.map(String), ...managed.map((t) => String(t._id))]),
+    ]
+      .map((id) => toObjectId(id))
+      .filter(Boolean);
+
+    if (allTeamIds.length) {
+      filter.$or = [
+        { teamId: { $in: allTeamIds } },
+        { teamIds: { $in: allTeamIds } },
+        { managerId: user._id },
+        { _id: user._id },
+      ];
+    } else {
+      filter.$or = [{ managerId: user._id }, { _id: user._id }];
+    }
+  }
+
+  return filter;
+}
+
 function mapStaffAttendance(log, breakLog) {
+  const date = log.date || formatDate();
   return {
     ...mapAttendance(log),
     empName: log.userId?.name || 'Unknown',
@@ -82,26 +198,34 @@ function mapStaffAttendance(log, breakLog) {
     employeeStatus: log.userId?.status || 'Active',
     shiftStart: log.userId?.shiftStart || DEFAULT_SHIFT_START,
     shiftEnd: log.userId?.shiftEnd || DEFAULT_SHIFT_END,
-    breakLog: mapBreakSummary(breakLog),
+    breakLog: mapBreakSummary(breakLog, date),
     branchId: log.userId?.branchId ? String(log.userId.branchId) : null,
     companyId: log.userId?.companyId ? String(log.userId.companyId) : null,
   };
 }
 
-// GET /api/attendance/overview — org live attendance dashboard
-router.get('/overview', protect, authorize('view_all_attendance'), async (req, res) => {
+// GET /api/attendance/overview — role-scoped live attendance dashboard
+router.get(
+  '/overview',
+  protect,
+  authorize('view_all_attendance', 'view_own_attendance'),
+  async (req, res) => {
   try {
     const today = formatDate();
+    const scopeMeta = attendanceScopeMeta(req.user);
     const companyIds = await resolveCompanyIds(req.user);
-    if (!companyIds.length) {
+    const dateLabel = new Date().toLocaleDateString('en-IN', {
+      weekday: 'long',
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+    });
+
+    if (!companyIds.length && !scopeMeta.isSelfService) {
       return sendSuccess(res, {
         date: today,
-        dateLabel: new Date().toLocaleDateString('en-IN', {
-          weekday: 'long',
-          day: 'numeric',
-          month: 'short',
-          year: 'numeric',
-        }),
+        dateLabel,
+        ...scopeMeta,
         summary: {
           totalEmployees: 0,
           present: 0,
@@ -117,18 +241,33 @@ router.get('/overview', protect, authorize('view_all_attendance'), async (req, r
       });
     }
 
-    const userFilter = {
-      ...ACTIVE_EMPLOYEE_FILTER,
-      companyId: { $in: companyIds.map((id) => toObjectId(id)).filter(Boolean) },
-    };
-    if (isBranchScopedRole(req.user.systemRole) && req.user.branchId) {
-      userFilter.branchId = req.user.branchId;
-    }
+    const userFilter = await resolveScopedEmployeeFilter(req.user);
 
     const employees = await User.find(userFilter).select(
       'name dept employeeId avatar status branchId companyId systemRole shiftStart shiftEnd',
     );
     const empIds = employees.map((e) => e._id);
+
+    const branchQuery = {
+      companyId: {
+        $in: (companyIds.length
+          ? companyIds
+          : req.user.companyId
+            ? [String(req.user.companyId)]
+            : []
+        )
+          .map((id) => toObjectId(id))
+          .filter(Boolean),
+      },
+    };
+    if (isBranchScopedRole(req.user.systemRole) && req.user.branchId) {
+      branchQuery._id = req.user.branchId;
+    }
+    // Managers / self — skip full branch list noise
+    const loadBranches =
+      !scopeMeta.isSelfService &&
+      scopeMeta.scope !== 'team' &&
+      branchQuery.companyId.$in.length > 0;
 
     const [logs, breakLogs, branches] = await Promise.all([
       empIds.length
@@ -147,17 +286,12 @@ router.get('/overview', protect, authorize('view_all_attendance'), async (req, r
         ? BreakLog.find({
             date: today,
             userId: { $in: empIds },
-            status: { $in: ['active', 'completed'] },
+            status: { $in: ['active', 'available', 'completed'] },
           })
             .populate('userId', 'name dept employeeId avatar branchId')
             .sort({ updatedAt: -1 })
         : [],
-      Branch.find({
-        companyId: { $in: companyIds.map((id) => toObjectId(id)).filter(Boolean) },
-        ...(isBranchScopedRole(req.user.systemRole) && req.user.branchId
-          ? { _id: req.user.branchId }
-          : {}),
-      }).sort({ name: 1 }),
+      loadBranches ? Branch.find(branchQuery).sort({ name: 1 }) : [],
     ]);
 
     const late = logs.filter((l) => l.status === 'Delayed').length;
@@ -278,16 +412,10 @@ router.get('/overview', protect, authorize('view_all_attendance'), async (req, r
 
     activity.sort((a, b) => new Date(b.at) - new Date(a.at));
 
-    const dateLabel = new Date().toLocaleDateString('en-IN', {
-      weekday: 'long',
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-    });
-
     return sendSuccess(res, {
       date: today,
       dateLabel,
+      ...scopeMeta,
       summary: {
         totalEmployees,
         present,
@@ -313,7 +441,8 @@ router.get('/overview', protect, authorize('view_all_attendance'), async (req, r
   } catch (err) {
     return sendError(res, err.message, 500);
   }
-});
+},
+);
 
 // GET /api/attendance/history/report — printable log for current user
 router.get('/history/report', protect, async (req, res) => {
@@ -333,7 +462,15 @@ router.get('/history/report', protect, async (req, res) => {
           delayReason: log.delayReason || '',
           breakStart: breakLog?.startTime || '--',
           breakEnd: breakLog?.endTime || '--',
-          breakDuration: breakLog?.duration || '--',
+          breakDuration: breakLog
+            ? mapBreakSummary(breakLog, log.date)?.usedLabel || breakLog.duration || '--'
+            : '--',
+          breakUsedSeconds: breakLog
+            ? mapBreakSummary(breakLog, log.date)?.usedSeconds || 0
+            : 0,
+          breakRemainingSeconds: breakLog
+            ? mapBreakSummary(breakLog, log.date)?.remainingSeconds || 0
+            : 0,
         };
       }),
     );
@@ -370,7 +507,7 @@ router.get('/history', protect, async (req, res) => {
 
     const attendance = logs.map((log) => ({
       ...mapAttendance(log),
-      breakLog: mapBreakSummary(breakByDate.get(log.date)),
+      breakLog: mapBreakSummary(breakByDate.get(log.date), log.date),
     }));
 
     return sendSuccess(res, { attendance });
@@ -392,28 +529,18 @@ router.get('/today', protect, async (req, res) => {
       shiftStart: req.user.shiftStart || DEFAULT_SHIFT_START,
       shiftEnd: req.user.shiftEnd || DEFAULT_SHIFT_END,
       attendance: log ? mapAttendance(log) : null,
-      breakLog: mapBreakSummary(breakLog),
+      breakLog: mapBreakSummary(breakLog, today),
     });
   } catch (err) {
     return sendError(res, err.message, 500);
   }
 });
 
-// GET /api/attendance/all — org-wide today (HR / Manager / Super Admin)
+// GET /api/attendance/all — scoped today (Owner / SA / BH / HR / Manager)
 router.get('/all', protect, authorize('view_all_attendance'), async (req, res) => {
   try {
     const today = formatDate();
-    const companyIds = await resolveCompanyIds(req.user);
-
-    const userFilter = { ...ACTIVE_EMPLOYEE_FILTER };
-    if (companyIds.length) {
-      userFilter.companyId = {
-        $in: companyIds.map((id) => toObjectId(id)).filter(Boolean),
-      };
-    }
-    if (isBranchScopedRole(req.user.systemRole) && req.user.branchId) {
-      userFilter.branchId = req.user.branchId;
-    }
+    const userFilter = await resolveScopedEmployeeFilter(req.user);
 
     const scopedUsers = await User.find(userFilter).select('_id');
     const scopedIds = scopedUsers.map((u) => u._id);
@@ -459,6 +586,127 @@ router.get('/all', protect, authorize('view_all_attendance'), async (req, res) =
     return sendError(res, err.message, 500);
   }
 });
+
+// GET /api/attendance/staff-history — scoped employee attendance + break history
+router.get(
+  '/staff-history',
+  protect,
+  authorize('view_all_attendance', 'view_team_attendance', 'view_own_attendance'),
+  async (req, res) => {
+    try {
+      const scopeMeta = attendanceScopeMeta(req.user);
+      const userFilter = await resolveScopedEmployeeFilter(req.user);
+      const days = Math.min(60, Math.max(1, Number(req.query.days) || 14));
+      const userIdParam = String(req.query.userId || '').trim();
+      const today = formatDate();
+
+      let employees = await User.find(userFilter)
+        .select(
+          'name dept employeeId avatar status branchId companyId role systemRole',
+        )
+        .sort({ name: 1 })
+        .limit(500);
+
+      if (userIdParam) {
+        employees = employees.filter(
+          (e) =>
+            String(e._id) === userIdParam ||
+            String(e.employeeId || '') === userIdParam,
+        );
+        if (!employees.length) {
+          return sendError(res, 'Employee not in your scope', 403);
+        }
+      }
+
+      const empIds = employees.map((e) => e._id);
+      const since = new Date();
+      since.setDate(since.getDate() - (days - 1));
+      const sinceKey = formatDate(since);
+
+      const [logs, breakLogs] = await Promise.all([
+        empIds.length
+          ? AttendanceLog.find({
+              userId: { $in: empIds },
+              date: { $gte: sinceKey },
+              timeIn: { $exists: true, $ne: '' },
+            })
+              .populate(
+                'userId',
+                'name dept employeeId avatar status systemRole',
+              )
+              .sort({ date: -1, timeIn: -1 })
+          : [],
+        empIds.length
+          ? BreakLog.find({
+              userId: { $in: empIds },
+              date: { $gte: sinceKey },
+            })
+          : [],
+      ]);
+
+      const breakByKey = new Map(
+        breakLogs.map((b) => [`${String(b.userId)}:${b.date}`, b]),
+      );
+
+      const rows = logs.map((log) => {
+        const populated = log.userId && typeof log.userId === 'object' ? log.userId : null;
+        const uid = populated?._id
+          ? String(populated._id)
+          : String(log.userId || '');
+        const brk = breakByKey.get(`${uid}:${log.date}`);
+        const breakSummary = mapBreakSummary(brk, log.date);
+        const breakTaken =
+          Boolean(breakSummary) &&
+          breakSummary.status &&
+          breakSummary.status !== 'not_started';
+
+        return {
+          id: `${uid}-${log.date}`,
+          userId: uid,
+          date: log.date,
+          isToday: log.date === today,
+          empName: populated?.name || 'Unknown',
+          empId: populated?.employeeId || '',
+          dept: populated?.dept || '',
+          systemRole: populated?.systemRole || '',
+          avatar: resolveAvatar(populated?.avatar, populated?.name),
+          status: log.status,
+          timeIn: log.timeIn || '',
+          timeOut: log.timeOut || '',
+          delayReason: log.delayReason || null,
+          breakLog: breakSummary,
+          breakUsedLabel: breakTaken ? breakSummary.usedLabel : '—',
+          breakRemainingLabel: breakTaken ? breakSummary.remainingLabel : '—',
+        };
+      });
+
+      // Prefer today first, then newest dates
+      rows.sort((a, b) => {
+        if (a.isToday !== b.isToday) return a.isToday ? -1 : 1;
+        return String(b.date).localeCompare(String(a.date));
+      });
+
+      return sendSuccess(res, {
+        days,
+        today,
+        total: rows.length,
+        todayCount: rows.filter((r) => r.isToday).length,
+        ...scopeMeta,
+        employees: employees.map((e) => ({
+          id: String(e._id),
+          name: e.name,
+          employeeId: e.employeeId || '',
+          dept: e.dept || '',
+          systemRole: e.systemRole || '',
+          avatar: resolveAvatar(e.avatar, e.name),
+        })),
+        rows,
+      });
+    } catch (err) {
+      return sendError(res, err.message, 500);
+    }
+  },
+);
 
 // POST /api/attendance/check-in
 router.post('/check-in', protect, authorize('clock_in'), async (req, res) => {

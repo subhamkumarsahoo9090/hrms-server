@@ -2,6 +2,17 @@ const mongoose = require('mongoose');
 
 const LEAVE_TYPES = ['Casual Leave', 'Sick Leave', 'Earned Leave', 'Comp Off', 'Maternity', 'Unpaid'];
 
+const approvalHistorySchema = new mongoose.Schema(
+  {
+    role: { type: String, default: '' },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    action: { type: String, enum: ['approved', 'rejected'], required: true },
+    note: { type: String, default: '' },
+    at: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
 const leaveRequestSchema = new mongoose.Schema(
   {
     companyId: {
@@ -38,6 +49,13 @@ const leaveRequestSchema = new mongoose.Schema(
       default: 'Pending',
       index: true,
     },
+    /** Requester systemRole at apply time */
+    requesterRole: { type: String, default: '' },
+    /** Remaining chain of approver roles, e.g. ['manager','hr'] */
+    approvalChain: { type: [String], default: [] },
+    /** Who must act next while Pending */
+    currentApproverRole: { type: String, default: null, index: true },
+    approvalHistory: { type: [approvalHistorySchema], default: [] },
     appliedAt: { type: Date, default: Date.now },
     reviewedBy: {
       type: mongoose.Schema.Types.ObjectId,
@@ -51,6 +69,7 @@ const leaveRequestSchema = new mongoose.Schema(
 );
 
 leaveRequestSchema.index({ companyId: 1, status: 1, appliedAt: -1 });
+leaveRequestSchema.index({ currentApproverRole: 1, status: 1 });
 
 module.exports = mongoose.model('LeaveRequest', leaveRequestSchema);
 module.exports.LEAVE_TYPES = LEAVE_TYPES;

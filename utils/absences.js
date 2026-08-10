@@ -8,6 +8,11 @@ const ACTIVE_EMPLOYEE_FILTER = {
   systemRole: { $ne: 'super_admin' },
 };
 
+/** Who can appear on attendance / clock history (includes owner + super admin). */
+const ATTENDANCE_SCOPE_FILTER = {
+  isActive: true,
+};
+
 function mapAbsentUser(emp, reason) {
   return {
     id: emp.employeeId,
@@ -74,5 +79,6 @@ async function getTodayAbsentUsers(date = formatDate()) {
 
 module.exports = {
   ACTIVE_EMPLOYEE_FILTER,
+  ATTENDANCE_SCOPE_FILTER,
   getTodayAbsentUsers,
 };

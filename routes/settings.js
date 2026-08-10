@@ -4,6 +4,7 @@ const { protect } = require('../middleware/auth');
 const { authorize } = require('../middleware/authorize');
 const { ROLE_LABELS, PERMISSION_MATRIX } = require('../constants/permissions');
 const { sendSuccess, sendError } = require('../utils/helpers');
+const { writeAudit } = require('../utils/audit');
 
 const router = express.Router();
 
@@ -47,6 +48,14 @@ router.patch('/', protect, authorize('manage_system_settings'), async (req, res)
         { upsert: true }
       );
     }
+
+    await writeAudit({
+      actor: req.user,
+      action: `Updated system settings (${Object.keys(updates).join(', ')})`,
+      category: 'config',
+      entityType: 'settings',
+      meta: { keys: Object.keys(updates) },
+    });
 
     const stored = await SystemSettings.find();
     const settings = { ...DEFAULT_SETTINGS };

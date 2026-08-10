@@ -9,11 +9,11 @@ const menuFeedbackSchema = new mongoose.Schema(
     liked: { type: Boolean, default: true },
     comment: { type: String, default: '' },
     time: { type: String, default: '' },
-    date: { type: String, default: '' },
+    date: { type: String, default: '', index: true },
   },
   { timestamps: true },
 );
 
-menuFeedbackSchema.index({ userId: 1, itemId: 1 });
+menuFeedbackSchema.index({ userId: 1, itemId: 1, date: 1 }, { unique: true });
 
 module.exports = mongoose.model('MenuFeedback', menuFeedbackSchema);

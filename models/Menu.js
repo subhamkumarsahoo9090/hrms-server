@@ -6,6 +6,11 @@ const menuSchema = new mongoose.Schema(
     catalogItemIds: [
       { type: mongoose.Schema.Types.ObjectId, ref: 'MenuCatalog' },
     ],
+    menuCardId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'MenuCard',
+      default: null,
+    },
     // Legacy fields kept for backward compatibility during migration
     mainCourse: { type: String, default: '' },
     sides: { type: String, default: '' },

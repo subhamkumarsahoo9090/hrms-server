@@ -426,6 +426,7 @@ router.post('/', protect, async (req, res) => {
       branchId: targetBranchId || null,
       departmentId: targetDeptId || null,
       teamId: targetTeamId || null,
+      teamIds: targetTeamId ? [targetTeamId] : [],
       managerId: toObjectId(managerId) || null,
       salary: salary ?? (isHr ? 5000 : 4000),
       status: status || 'Active',
@@ -499,6 +500,18 @@ router.patch('/:id', protect, authorize('edit_employees'), async (req, res) => {
         }
       }
     });
+
+    if (req.body.teamId !== undefined) {
+      const tid = toObjectId(req.body.teamId);
+      if (tid) {
+        const ids = new Set((employee.teamIds || []).map(String));
+        ids.add(String(tid));
+        employee.teamIds = [...ids];
+        employee.teamId = tid;
+      } else {
+        employee.teamId = null;
+      }
+    }
 
     if (req.body.isActive === true) {
       employee.isActive = true;

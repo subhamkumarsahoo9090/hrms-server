@@ -14,9 +14,18 @@ const { authorize } = require('../middleware/authorize');
 const {
   isCompanyWideRole,
   isBranchScopedRole,
+  isTeamScopedRole,
 } = require('../constants/permissions');
 const { canAssignToBranch, assertSameCompany, toObjectId } = require('../utils/scope');
-const { sendSuccess, sendError, resolveAvatar } = require('../utils/helpers');
+const { sendSuccess, sendError, resolveAvatar, buildUserLookupFilter } = require('../utils/helpers');
+const {
+  teamMemberFilter,
+  getUserTeamIdList,
+  userBelongsToTeam,
+  addUserToTeam,
+  removeUserFromTeam,
+  setUserPrimaryTeamOnly,
+} = require('../utils/teamMembership');
 
 const router = express.Router();
 
@@ -72,6 +81,30 @@ function sanitizeTeam(t) {
     managerId: obj.managerId ? String(obj.managerId) : null,
     status: obj.status,
   };
+}
+
+/** Owner, membership, company-wide role, or same-company branch/team-scoped role */
+async function canAccessCompany(actor, companyId) {
+  if (!companyId) return false;
+  if (String(actor.companyId) === String(companyId)) {
+    if (
+      isCompanyWideRole(actor.systemRole) ||
+      isBranchScopedRole(actor.systemRole) ||
+      isTeamScopedRole(actor.systemRole)
+    ) {
+      return true;
+    }
+  }
+  const owns = await Company.findOne({
+    _id: companyId,
+    ownerUserId: actor._id,
+  });
+  if (owns) return true;
+  const membership = await CompanyMembership.findOne({
+    userId: actor._id,
+    companyId,
+  });
+  return !!membership;
 }
 
 function slugify(value) {
@@ -831,28 +864,29 @@ router.get('/teams', protect, async (req, res) => {
 
     const enriched = await Promise.all(
       teams.map(async (t) => {
-        const members = await User.find({
-          teamId: t._id,
-          isActive: { $ne: false },
-        })
-          .select('name employeeId role systemRole dept status email avatar')
+        const members = await User.find(
+          teamMemberFilter(t._id, { isActive: { $ne: false } }),
+        )
+          .select('name employeeId role systemRole dept status email avatar teamId teamIds')
           .sort({ name: 1 });
 
         const branch = branchById.get(String(t.branchId));
         const dept = deptById.get(String(t.departmentId));
         const company = companyById.get(String(t.companyId));
         const manager = t.managerId ? managerById.get(String(t.managerId)) : null;
-        return {
-          ...sanitizeTeam(t),
-          departmentName: dept?.name || '',
-          branchName: branch?.name || '',
-          branchCode: branch?.code || '',
-          companyName: company?.name || '',
-          companySlug: company?.slug || '',
-          managerName: manager?.name || '',
-          managerEmail: manager?.email || '',
-          memberCount: members.length,
-          members: members.map((m) => ({
+
+        const memberPayload = members.map((m) => {
+          const allTeamIds = getUserTeamIdList(m).map(String);
+          const otherTeamIds = allTeamIds.filter((id) => id !== String(t._id));
+          const otherTeams = otherTeamIds
+            .map((id) => {
+              const ot = teams.find((x) => String(x._id) === id);
+              return ot
+                ? { id: String(ot._id), name: ot.name }
+                : null;
+            })
+            .filter(Boolean);
+          return {
             id: String(m._id),
             employeeId: m.employeeId,
             name: m.name,
@@ -862,7 +896,22 @@ router.get('/teams', protect, async (req, res) => {
             status: m.status || 'Active',
             email: m.email,
             avatar: resolveAvatar(m.avatar, m.name),
-          })),
+            teamIds: allTeamIds,
+            otherTeams,
+          };
+        });
+
+        return {
+          ...sanitizeTeam(t),
+          departmentName: dept?.name || '',
+          branchName: branch?.name || '',
+          branchCode: branch?.code || '',
+          companyName: company?.name || '',
+          companySlug: company?.slug || '',
+          managerName: manager?.name || '',
+          managerEmail: manager?.email || '',
+          memberCount: memberPayload.length,
+          members: memberPayload,
         };
       }),
     );
@@ -885,20 +934,21 @@ router.get('/teams', protect, async (req, res) => {
 
 /**
  * POST /api/org/teams/assign
- * Company Owner moves any user into any team they own.
- * Body: { userId, teamId }
- * Syncs company/branch/department/dept/manager from the target team.
+ * Company Owner adds (or exclusively moves) a user onto a team.
+ * Body: { userId, teamId, mode?: 'add' | 'move' }
+ * - add (default): user can stay on other teams too
+ * - move: replace all memberships with this team only
  */
-router.post('/teams/assign', protect, authorize('manage_companies'), async (req, res) => {
+router.post('/teams/assign', protect, authorize('create_team', 'manage_companies'), async (req, res) => {
   try {
-    const userId = toObjectId(req.body.userId);
     const teamId = toObjectId(req.body.teamId);
-    if (!userId || !teamId) {
+    const mode = req.body.mode === 'move' ? 'move' : 'add';
+    if (!req.body.userId || !teamId) {
       return sendError(res, 'userId and teamId are required');
     }
 
     const [user, team] = await Promise.all([
-      User.findById(userId),
+      User.findOne(buildUserLookupFilter(req.body.userId)),
       Team.findById(teamId),
     ]);
 
@@ -909,60 +959,71 @@ router.post('/teams/assign', protect, authorize('manage_companies'), async (req,
       return sendError(res, 'Team not found', 404);
     }
 
-    const ownsTeamCompany = await Company.findOne({
-      _id: team.companyId,
-      ownerUserId: req.user._id,
-    });
-    const memberTeam = await CompanyMembership.findOne({
-      userId: req.user._id,
-      companyId: team.companyId,
-    });
-    if (!ownsTeamCompany && !memberTeam) {
+    const ownsTeamCompany = await canAccessCompany(req.user, team.companyId);
+    if (!ownsTeamCompany) {
       return sendError(res, 'You do not own this team’s company', 403);
     }
 
+    if (
+      isBranchScopedRole(req.user.systemRole) &&
+      !canAssignToBranch(req.user, team.branchId)
+    ) {
+      return sendError(res, 'You can only manage teams in your own branch', 403);
+    }
+
+    if (isTeamScopedRole(req.user.systemRole)) {
+      const myTeams = getUserTeamIdList(req.user).map(String);
+      const isMgr = team.managerId && String(team.managerId) === String(req.user._id);
+      if (!isMgr && !myTeams.includes(String(team._id))) {
+        return sendError(res, 'You can only manage your own teams', 403);
+      }
+    }
+
     if (user.companyId) {
-      const ownsUserCompany = await Company.findOne({
-        _id: user.companyId,
-        ownerUserId: req.user._id,
-      });
-      const memberUser = await CompanyMembership.findOne({
-        userId: req.user._id,
-        companyId: user.companyId,
-      });
-      if (!ownsUserCompany && !memberUser) {
+      const ownsUserCompany = await canAccessCompany(req.user, user.companyId);
+      if (!ownsUserCompany) {
         return sendError(res, 'You do not own this user’s company', 403);
       }
     }
 
-    const [dept, branch] = await Promise.all([
-      Department.findById(team.departmentId),
-      Branch.findById(team.branchId),
-    ]);
-
-    const previousTeamId = user.teamId;
-
-    // If this user was manager of another team, clear that link
-    if (previousTeamId && String(previousTeamId) !== String(team._id)) {
-      await Team.updateMany(
-        { _id: previousTeamId, managerId: user._id },
-        { $set: { managerId: null } },
-      );
+    if (mode === 'add' && userBelongsToTeam(user, team._id)) {
+      return sendError(res, `${user.name} is already on ${team.name}`, 409);
     }
 
-    user.companyId = team.companyId;
-    user.branchId = team.branchId;
-    user.departmentId = team.departmentId;
-    user.teamId = team._id;
-    if (dept?.name) user.dept = dept.name;
+    const previousTeamIds = getUserTeamIdList(user).map(String);
 
-    if (team.managerId && String(team.managerId) !== String(user._id)) {
-      user.managerId = team.managerId;
-    } else if (String(team.managerId) === String(user._id)) {
-      user.managerId = null;
+    if (mode === 'move') {
+      // Clear manager link on teams they leave
+      const leaving = previousTeamIds.filter((id) => id !== String(team._id));
+      if (leaving.length) {
+        await Team.updateMany(
+          {
+            _id: { $in: leaving.map((id) => toObjectId(id)).filter(Boolean) },
+            managerId: user._id,
+          },
+          { $set: { managerId: null } },
+        );
+      }
+      setUserPrimaryTeamOnly(user, team._id);
+      // Align home org fields on exclusive move
+      const dept = await Department.findById(team.departmentId);
+      user.companyId = team.companyId;
+      user.branchId = team.branchId;
+      user.departmentId = team.departmentId;
+      if (dept?.name) user.dept = dept.name;
+      if (team.managerId && String(team.managerId) !== String(user._id)) {
+        user.managerId = team.managerId;
+      }
+    } else {
+      addUserToTeam(user, team._id);
+      if (!user.companyId) user.companyId = team.companyId;
+      if (!user.branchId) user.branchId = team.branchId;
     }
 
     await user.save();
+
+    const branch = await Branch.findById(team.branchId);
+    const dept = await Department.findById(team.departmentId);
 
     return sendSuccess(
       res,
@@ -971,7 +1032,8 @@ router.post('/teams/assign', protect, authorize('manage_companies'), async (req,
           id: String(user._id),
           name: user.name,
           employeeId: user.employeeId,
-          teamId: String(team._id),
+          teamId: user.teamId ? String(user.teamId) : null,
+          teamIds: getUserTeamIdList(user).map(String),
           teamName: team.name,
           departmentId: team.departmentId ? String(team.departmentId) : null,
           departmentName: dept?.name || '',
@@ -979,10 +1041,69 @@ router.post('/teams/assign', protect, authorize('manage_companies'), async (req,
           branchName: branch?.name || '',
           companyId: String(team.companyId),
         },
-        fromTeamId: previousTeamId ? String(previousTeamId) : null,
+        mode,
+        fromTeamIds: previousTeamIds,
         toTeamId: String(team._id),
       },
-      `${user.name} moved to ${team.name}`,
+      mode === 'move'
+        ? `${user.name} moved to ${team.name}`
+        : `${user.name} added to ${team.name}`,
+    );
+  } catch (err) {
+    return sendError(res, err.message, 500);
+  }
+});
+
+/**
+ * POST /api/org/teams/remove-member
+ * Company Owner removes a user from one team (keeps other team memberships).
+ * Body: { userId, teamId }
+ */
+router.post('/teams/remove-member', protect, authorize('create_team', 'manage_companies'), async (req, res) => {
+  try {
+    const teamId = toObjectId(req.body.teamId);
+    if (!req.body.userId || !teamId) {
+      return sendError(res, 'userId and teamId are required');
+    }
+
+    const [user, team] = await Promise.all([
+      User.findOne(buildUserLookupFilter(req.body.userId)),
+      Team.findById(teamId),
+    ]);
+    if (!user) return sendError(res, 'User not found', 404);
+    if (!team) return sendError(res, 'Team not found', 404);
+
+    const owns = await canAccessCompany(req.user, team.companyId);
+    if (!owns) {
+      return sendError(res, 'You do not own this team’s company', 403);
+    }
+
+    if (
+      isBranchScopedRole(req.user.systemRole) &&
+      !canAssignToBranch(req.user, team.branchId)
+    ) {
+      return sendError(res, 'You can only manage teams in your own branch', 403);
+    }
+
+    if (!userBelongsToTeam(user, teamId)) {
+      return sendError(res, `${user.name} is not on ${team.name}`, 400);
+    }
+
+    removeUserFromTeam(user, teamId);
+    if (team.managerId && String(team.managerId) === String(user._id)) {
+      team.managerId = null;
+      await team.save();
+    }
+    await user.save();
+
+    return sendSuccess(
+      res,
+      {
+        userId: String(user._id),
+        teamId: String(teamId),
+        teamIds: getUserTeamIdList(user).map(String),
+      },
+      `${user.name} removed from ${team.name}`,
     );
   } catch (err) {
     return sendError(res, err.message, 500);
@@ -1014,10 +1135,9 @@ router.get('/teams/:id/members', protect, async (req, res) => {
       return sendError(res, 'You do not have access to this team', 403);
     }
 
-    const members = await User.find({
-      teamId: team._id,
-      isActive: { $ne: false },
-    }).sort({ name: 1 });
+    const members = await User.find(
+      teamMemberFilter(team._id, { isActive: { $ne: false } }),
+    ).sort({ name: 1 });
 
     const branch = await Branch.findById(team.branchId);
     const dept = await Department.findById(team.departmentId);
@@ -1038,6 +1158,7 @@ router.get('/teams/:id/members', protect, async (req, res) => {
         status: m.status || 'Active',
         email: m.email,
         avatar: resolveAvatar(m.avatar, m.name),
+        teamIds: getUserTeamIdList(m).map(String),
       })),
     });
   } catch (err) {
@@ -1149,7 +1270,7 @@ router.post('/teams', protect, authorize('create_team'), async (req, res) => {
  * - If team has members, reassignToTeamId is required — members move there first, then delete.
  * - Empty teams can be deleted without reassignment.
  */
-router.delete('/teams/:id', protect, authorize('manage_companies'), async (req, res) => {
+router.delete('/teams/:id', protect, authorize('create_team', 'manage_companies'), async (req, res) => {
   try {
     const teamId = toObjectId(req.params.id);
     if (!teamId) {
@@ -1161,22 +1282,21 @@ router.delete('/teams/:id', protect, authorize('manage_companies'), async (req, 
       return sendError(res, 'Team not found', 404);
     }
 
-    const owns = await Company.findOne({
-      _id: team.companyId,
-      ownerUserId: req.user._id,
-    });
-    const membership = await CompanyMembership.findOne({
-      userId: req.user._id,
-      companyId: team.companyId,
-    });
-    if (!owns && !membership) {
+    const owns = await canAccessCompany(req.user, team.companyId);
+    if (!owns) {
       return sendError(res, 'Forbidden — you do not own this team’s company', 403);
     }
 
-    const members = await User.find({
-      teamId,
-      isActive: { $ne: false },
-    });
+    if (
+      isBranchScopedRole(req.user.systemRole) &&
+      !canAssignToBranch(req.user, team.branchId)
+    ) {
+      return sendError(res, 'You can only manage teams in your own branch', 403);
+    }
+
+    const members = await User.find(
+      teamMemberFilter(teamId, { isActive: { $ne: false } }),
+    );
 
     let reassignedTo = null;
     let reassignedCount = 0;
@@ -1199,30 +1319,24 @@ router.delete('/teams/:id', protect, authorize('manage_companies'), async (req, 
         return sendError(res, 'Destination team not found', 404);
       }
 
-      const ownsTarget = await Company.findOne({
-        _id: target.companyId,
-        ownerUserId: req.user._id,
-      });
-      const memberTarget = await CompanyMembership.findOne({
-        userId: req.user._id,
-        companyId: target.companyId,
-      });
-      if (!ownsTarget && !memberTarget) {
+      const ownsTarget = await canAccessCompany(req.user, target.companyId);
+      if (!ownsTarget) {
         return sendError(res, 'You do not own the destination team’s company', 403);
       }
 
-      const [dept] = await Promise.all([Department.findById(target.departmentId)]);
+      const dept = await Department.findById(target.departmentId);
 
       for (const user of members) {
-        user.companyId = target.companyId;
-        user.branchId = target.branchId;
-        user.departmentId = target.departmentId;
-        user.teamId = target._id;
-        if (dept?.name) user.dept = dept.name;
-        if (target.managerId && String(target.managerId) !== String(user._id)) {
-          user.managerId = target.managerId;
-        } else if (String(target.managerId) === String(user._id)) {
-          user.managerId = null;
+        removeUserFromTeam(user, teamId);
+        addUserToTeam(user, target._id);
+        // Keep home org on destination for primary continuity
+        if (!user.teamId || String(user.teamId) === String(teamId)) {
+          user.teamId = target._id;
+        }
+        if (dept?.name && String(user.departmentId) === String(team.departmentId)) {
+          user.departmentId = target.departmentId;
+          user.dept = dept.name;
+          user.branchId = target.branchId;
         }
         await user.save();
       }
@@ -1232,6 +1346,13 @@ router.delete('/teams/:id', protect, authorize('manage_companies'), async (req, 
         name: target.name,
       };
       reassignedCount = members.length;
+    }
+
+    // Ensure no leftover memberships on the deleted team
+    const leftovers = await User.find(teamMemberFilter(teamId));
+    for (const user of leftovers) {
+      removeUserFromTeam(user, teamId);
+      await user.save();
     }
 
     const name = team.name;

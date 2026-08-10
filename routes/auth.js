@@ -3,14 +3,164 @@ const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Company = require('../models/Company');
 const Branch = require('../models/Branch');
+const Department = require('../models/Department');
+const Team = require('../models/Team');
 const CompanyMembership = require('../models/CompanyMembership');
+const LeaveRequest = require('../models/LeaveRequest');
+const AttendanceLog = require('../models/AttendanceLog');
+const SalarySlip = require('../models/SalarySlip');
+const Task = require('../models/Task');
 const { protect } = require('../middleware/auth');
 const { uploadAvatar } = require('../middleware/uploadAvatar');
 const { deleteStoredAvatar } = require('../utils/avatar');
-const { sendSuccess, sendError, sanitizeUser } = require('../utils/helpers');
+const { sendSuccess, sendError, sanitizeUser, resolveAvatar } = require('../utils/helpers');
 const { toObjectId } = require('../utils/scope');
 
 const router = express.Router();
+
+const LEAVE_POLICY = [
+  { type: 'Casual Leave', allotted: 12 },
+  { type: 'Sick Leave', allotted: 10 },
+  { type: 'Earned Leave', allotted: 15 },
+  { type: 'Comp Off', allotted: 5 },
+];
+
+function formatInr(n) {
+  return `₹${Math.round(Number(n) || 0).toLocaleString('en-IN')}`;
+}
+
+async function buildProfilePayload(userDoc) {
+  const user = sanitizeUser(userDoc);
+  const [
+    company,
+    branch,
+    department,
+    team,
+    manager,
+    companies,
+    leaveApproved,
+    monthLogs,
+    slips,
+    openTasks,
+    completedTasks,
+  ] = await Promise.all([
+    userDoc.companyId ? Company.findById(userDoc.companyId).select('name slug city status') : null,
+    userDoc.branchId ? Branch.findById(userDoc.branchId).select('name code city') : null,
+    userDoc.departmentId
+      ? Department.findById(userDoc.departmentId).select('name code')
+      : null,
+    userDoc.teamId ? Team.findById(userDoc.teamId).select('name status') : null,
+    userDoc.managerId
+      ? User.findById(userDoc.managerId).select('name role systemRole avatar employeeId')
+      : null,
+    getAccessibleCompanies(userDoc),
+    LeaveRequest.find({
+      userId: userDoc._id,
+      status: 'Approved',
+    }).select('leaveType days'),
+    (() => {
+      const now = new Date();
+      const start = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
+      const end = now.toISOString().slice(0, 10);
+      return AttendanceLog.find({
+        userId: userDoc._id,
+        date: { $gte: start, $lte: end },
+      }).select('timeIn status');
+    })(),
+    SalarySlip.find({ userId: userDoc._id }).sort({ createdAt: -1 }).limit(1),
+    Task.countDocuments({
+      assigneeId: userDoc._id,
+      status: { $ne: 'Completed' },
+    }),
+    Task.countDocuments({
+      assigneeId: userDoc._id,
+      status: 'Completed',
+    }),
+  ]);
+
+  const usedByType = new Map();
+  leaveApproved.forEach((l) => {
+    const key = l.leaveType || 'Casual Leave';
+    usedByType.set(key, (usedByType.get(key) || 0) + (Number(l.days) || 0));
+  });
+  const balances = LEAVE_POLICY.map((p) => {
+    const used = Math.min(p.allotted, usedByType.get(p.type) || 0);
+    return {
+      type: p.type,
+      allotted: p.allotted,
+      used,
+      remaining: Math.max(0, p.allotted - used),
+    };
+  });
+  const leaveBalanceDays = balances.reduce((s, b) => s + b.remaining, 0);
+
+  const presentDays = monthLogs.filter(
+    (l) => l.timeIn || ['Present', 'Late', 'Remote'].includes(l.status),
+  ).length;
+  const workingDays = Math.max(1, new Date().getDate());
+  const attendanceRate = Math.round((presentDays / workingDays) * 1000) / 10;
+
+  const lastSlip = slips[0] || null;
+
+  return {
+    user,
+    company: company
+      ? {
+          id: String(company._id),
+          name: company.name,
+          slug: company.slug,
+          city: company.city || '',
+          status: company.status || 'Active',
+        }
+      : null,
+    branch: branch
+      ? {
+          id: String(branch._id),
+          name: branch.name,
+          code: branch.code || '',
+          city: branch.city || '',
+        }
+      : null,
+    department: department
+      ? {
+          id: String(department._id),
+          name: department.name,
+          code: department.code || '',
+        }
+      : null,
+    team: team
+      ? {
+          id: String(team._id),
+          name: team.name,
+          status: team.status || 'Active',
+        }
+      : null,
+    manager: manager
+      ? {
+          id: String(manager._id),
+          name: manager.name,
+          role: manager.role || manager.systemRole,
+          employeeId: manager.employeeId,
+          avatar: resolveAvatar(manager.avatar, manager.name),
+        }
+      : null,
+    companies,
+    stats: {
+      leaveBalanceDays,
+      leaveBalanceLabel: `${leaveBalanceDays} Days`,
+      leaveBalances: balances,
+      attendanceRate,
+      attendanceRateLabel: `${attendanceRate}%`,
+      presentDaysMtd: presentDays,
+      lastPayslipNet: lastSlip ? Number(lastSlip.net) || 0 : 0,
+      lastPayslipLabel: lastSlip ? formatInr(lastSlip.net) : '—',
+      lastPayslipMonth: lastSlip?.month || null,
+      openTasks,
+      completedTasks,
+      salaryLabel: formatInr(user.salary || 0),
+    },
+  };
+}
 
 function signToken(userId) {
   return jwt.sign({ id: userId }, process.env.JWT_SECRET || 'hrcore_dev_secret', {
@@ -250,6 +400,42 @@ router.get('/me', protect, async (req, res) => {
   });
 });
 
+// GET /api/auth/profile — full dynamic profile for the logged-in user
+router.get('/profile', protect, async (req, res) => {
+  try {
+    const fresh = await User.findById(req.user._id);
+    if (!fresh) return sendError(res, 'User not found', 404);
+    return sendSuccess(res, await buildProfilePayload(fresh));
+  } catch (err) {
+    return sendError(res, err.message, 500);
+  }
+});
+
+// PATCH /api/auth/profile — self-service update (name, phone)
+router.patch('/profile', protect, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id);
+    if (!user) return sendError(res, 'User not found', 404);
+
+    if (req.body.name !== undefined) {
+      const name = String(req.body.name || '').trim();
+      if (name.length < 2) {
+        return sendError(res, 'Name must be at least 2 characters');
+      }
+      user.name = name;
+    }
+
+    if (req.body.phone !== undefined) {
+      user.phone = String(req.body.phone || '').trim().slice(0, 20);
+    }
+
+    await user.save();
+    return sendSuccess(res, await buildProfilePayload(user), 'Profile updated');
+  } catch (err) {
+    return sendError(res, err.message, 500);
+  }
+});
+
 /**
  * POST /api/auth/switch-company
  * CEO (company_owner) switches active company context.
@@ -318,9 +504,10 @@ router.post('/profile/avatar', protect, (req, res) => {
 
       deleteStoredAvatar(previousAvatar);
 
+      const fresh = await User.findById(req.user._id);
       return sendSuccess(
         res,
-        { user: sanitizeUser(req.user) },
+        await buildProfilePayload(fresh || req.user),
         'Profile photo updated',
       );
     } catch (saveErr) {

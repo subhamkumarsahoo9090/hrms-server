@@ -6,7 +6,11 @@ const Company = require('../models/Company');
 const CompanyMembership = require('../models/CompanyMembership');
 const { protect } = require('../middleware/auth');
 const { authorize } = require('../middleware/authorize');
-const { isBranchScopedRole, isTeamScopedRole } = require('../constants/permissions');
+const {
+  isBranchScopedRole,
+  isTeamScopedRole,
+  hasPermission,
+} = require('../constants/permissions');
 const { toObjectId, canAccessEmployee } = require('../utils/scope');
 const {
   sendSuccess,
@@ -14,6 +18,14 @@ const {
   resolveAvatar,
 } = require('../utils/helpers');
 const { ACTIVE_EMPLOYEE_FILTER } = require('../utils/absences');
+const {
+  APPROVER_ROLE_LABELS,
+  approvalChainForRequester,
+  nextApproverRole,
+  workflowLabel,
+  canActOnLeaveStage,
+  ensureLeaveChainFields,
+} = require('../utils/leaveApproval');
 
 const router = express.Router();
 
@@ -74,8 +86,13 @@ function monthPrefix(date = new Date()) {
   return `${y}-${m}`;
 }
 
-function mapLeave(doc, userMap) {
+function canViewOrgLeave(actor) {
+  return hasPermission(actor.systemRole, 'view_leave');
+}
+
+function mapLeave(doc, userMap, opts = {}) {
   const u = userMap?.get(String(doc.userId)) || null;
+  const stage = doc.currentApproverRole || null;
   return {
     id: String(doc._id),
     companyId: String(doc.companyId),
@@ -96,11 +113,40 @@ function mapLeave(doc, userMap) {
     appliedAt: doc.appliedAt ? new Date(doc.appliedAt).toISOString() : null,
     reviewedAt: doc.reviewedAt ? new Date(doc.reviewedAt).toISOString() : null,
     reviewNote: doc.reviewNote || '',
+    requesterRole: doc.requesterRole || '',
+    currentApproverRole: stage,
+    currentApproverLabel: stage
+      ? APPROVER_ROLE_LABELS[stage] || stage
+      : doc.status === 'Approved'
+        ? 'Completed'
+        : '—',
+    approvalChain: doc.approvalChain || [],
+    awaitingMe: Boolean(opts.awaitingMe),
+    canApprove: Boolean(opts.canApprove),
+    approvalHistory: (doc.approvalHistory || []).map((h) => ({
+      role: h.role,
+      roleLabel: APPROVER_ROLE_LABELS[h.role] || h.role,
+      action: h.action,
+      note: h.note || '',
+      at: h.at ? new Date(h.at).toISOString() : null,
+    })),
   };
 }
 
 async function buildScopeFilter(actor) {
   const companyIds = await resolveCompanyIds(actor);
+  if (!companyIds.length && !canViewOrgLeave(actor)) {
+    // staff with no company still see own if they have companyId missing
+    return { userId: actor._id };
+  }
+
+  if (!canViewOrgLeave(actor)) {
+    return {
+      userId: actor._id,
+      ...(actor.companyId ? { companyId: actor.companyId } : {}),
+    };
+  }
+
   if (!companyIds.length) return null;
 
   const filter = {
@@ -111,117 +157,186 @@ async function buildScopeFilter(actor) {
     filter.branchId = actor.branchId;
   } else if (isTeamScopedRole(actor.systemRole)) {
     const teamFilter = { companyId: actor.companyId };
+    const teamOr = [{ managerId: actor._id }, { _id: actor._id }];
     if (actor.teamId) {
-      const reportees = await User.find({
-        ...teamFilter,
-        $or: [{ teamId: actor.teamId }, { managerId: actor._id }, { _id: actor._id }],
-      }).select('_id');
-      filter.userId = { $in: reportees.map((u) => u._id) };
-    } else {
-      filter.userId = { $in: [actor._id] };
+      teamOr.push({ teamId: actor.teamId });
+      teamOr.push({ teamIds: actor.teamId });
     }
+    if (Array.isArray(actor.teamIds)) {
+      for (const tid of actor.teamIds) {
+        teamOr.push({ teamId: tid });
+        teamOr.push({ teamIds: tid });
+      }
+    }
+    const reportees = await User.find({
+      ...teamFilter,
+      $or: teamOr,
+    }).select('_id');
+    filter.userId = { $in: reportees.map((u) => u._id) };
   }
 
   return filter;
 }
 
-// GET /api/leave/overview
-router.get('/overview', protect, authorize('view_leave'), async (req, res) => {
-  try {
-    const filter = await buildScopeFilter(req.user);
-    if (!filter) {
-      return sendSuccess(res, {
-        periodLabel: new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' }),
-        summary: { pending: 0, approved: 0, rejected: 0, total: 0 },
-        split: [],
-        balances: POLICY.map((p) => ({ ...p, used: 0 })),
-        requests: [],
-      });
+async function annotateRequests(actor, requests) {
+  const userIds = [...new Set(requests.map((r) => String(r.userId)))];
+  const users = userIds.length
+    ? await User.find({
+        _id: { $in: userIds.map((id) => toObjectId(id)).filter(Boolean) },
+      }).select('name avatar dept employeeId systemRole managerId teamId teamIds companyId branchId')
+    : [];
+  const userMap = new Map(users.map((u) => [String(u._id), u]));
+
+  const mapped = [];
+  for (const r of requests) {
+    const requester = userMap.get(String(r.userId));
+    if (requester) {
+      const dirty = await ensureLeaveChainFields(r, requester);
+      if (dirty) {
+        try {
+          await r.save();
+        } catch {
+          /* ignore migration save races */
+        }
+      }
     }
-
-    const prefix = monthPrefix();
-    const monthStart = new Date(`${prefix}-01T00:00:00.000Z`);
-    const yearStart = new Date(`${new Date().getFullYear()}-01-01T00:00:00.000Z`);
-
-    const [monthRequests, yearApproved, headcount] = await Promise.all([
-      LeaveRequest.find({
-        ...filter,
-        appliedAt: { $gte: monthStart },
-      }).sort({ appliedAt: -1 }),
-      LeaveRequest.find({
-        ...filter,
-        status: 'Approved',
-        appliedAt: { $gte: yearStart },
-      }).select('leaveType days'),
-      User.countDocuments({
-        ...ACTIVE_EMPLOYEE_FILTER,
-        companyId: filter.companyId,
-        ...(filter.branchId ? { branchId: filter.branchId } : {}),
+    const canApprove =
+      r.status === 'Pending' &&
+      hasPermission(actor.systemRole, 'approve_leave') &&
+      (await canActOnLeaveStage(actor, r, requester));
+    mapped.push(
+      mapLeave(r, userMap, {
+        awaitingMe: canApprove,
+        canApprove,
       }),
-    ]);
-
-    // Also include pending from earlier months still open
-    const openPending = await LeaveRequest.find({
-      ...filter,
-      status: 'Pending',
-      appliedAt: { $lt: monthStart },
-    }).sort({ appliedAt: -1 });
-
-    const byId = new Map();
-    [...monthRequests, ...openPending].forEach((r) => byId.set(String(r._id), r));
-    const allVisible = [...byId.values()].sort(
-      (a, b) => new Date(b.appliedAt) - new Date(a.appliedAt),
     );
-
-    const pending = allVisible.filter((r) => r.status === 'Pending').length;
-    const approved = monthRequests.filter((r) => r.status === 'Approved').length;
-    const rejected = monthRequests.filter((r) => r.status === 'Rejected').length;
-    const total = monthRequests.length;
-
-    const usedByType = new Map();
-    yearApproved.forEach((r) => {
-      usedByType.set(r.leaveType, (usedByType.get(r.leaveType) || 0) + (r.days || 0));
-    });
-
-    const denom = Math.max(1, headcount);
-    const balances = POLICY.map((p) => {
-      const orgUsed = usedByType.get(p.type) || 0;
-      const avgUsed = Math.min(p.allotted, Math.round((orgUsed / denom) * 10) / 10);
-      return {
-        type: p.type,
-        allotted: p.allotted,
-        used: avgUsed,
-        orgUsed,
-      };
-    });
-
-    const userIds = [...new Set(allVisible.map((r) => String(r.userId)))];
-    const users = userIds.length
-      ? await User.find({
-          _id: { $in: userIds.map((id) => toObjectId(id)).filter(Boolean) },
-        }).select('name avatar dept employeeId')
-      : [];
-    const userMap = new Map(users.map((u) => [String(u._id), u]));
-
-    return sendSuccess(res, {
-      periodLabel: new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' }),
-      summary: { pending, approved, rejected, total },
-      split: [
-        { label: 'Approved', value: approved },
-        { label: 'Pending', value: pending },
-        { label: 'Rejected', value: rejected },
-      ],
-      balances,
-      requests: allVisible.slice(0, 50).map((r) => mapLeave(r, userMap)),
-      leaveTypes: LEAVE_TYPES,
-    });
-  } catch (err) {
-    return sendError(res, err.message, 500);
   }
-});
+  return mapped;
+}
 
-// GET /api/leave — list (optional ?status=)
-router.get('/', protect, authorize('view_leave'), async (req, res) => {
+// GET /api/leave/overview
+router.get(
+  '/overview',
+  protect,
+  authorize('view_leave', 'view_own_leave'),
+  async (req, res) => {
+    try {
+      const filter = await buildScopeFilter(req.user);
+      if (!filter) {
+        return sendSuccess(res, {
+          periodLabel: new Date().toLocaleString('en-US', {
+            month: 'long',
+            year: 'numeric',
+          }),
+          summary: { pending: 0, approved: 0, rejected: 0, total: 0, awaitingMe: 0 },
+          split: [],
+          balances: POLICY.map((p) => ({ ...p, used: 0 })),
+          requests: [],
+          leaveTypes: LEAVE_TYPES,
+          workflow: workflowLabel(),
+          canApprove: hasPermission(req.user.systemRole, 'approve_leave'),
+          canApplyForOthers: ['company_owner', 'super_admin', 'branch_head', 'hr'].includes(
+            req.user.systemRole,
+          ),
+          isSelfService: !canViewOrgLeave(req.user),
+        });
+      }
+
+      const prefix = monthPrefix();
+      const monthStart = new Date(`${prefix}-01T00:00:00.000Z`);
+      const yearStart = new Date(`${new Date().getFullYear()}-01-01T00:00:00.000Z`);
+
+      const selfOnly = !canViewOrgLeave(req.user);
+      const balanceFilter = selfOnly
+        ? { userId: req.user._id }
+        : filter;
+
+      const [monthRequests, yearApproved, headcount] = await Promise.all([
+        LeaveRequest.find({
+          ...filter,
+          appliedAt: { $gte: monthStart },
+        }).sort({ appliedAt: -1 }),
+        LeaveRequest.find({
+          ...balanceFilter,
+          status: 'Approved',
+          appliedAt: { $gte: yearStart },
+        }).select('leaveType days'),
+        selfOnly
+          ? Promise.resolve(1)
+          : User.countDocuments({
+              ...ACTIVE_EMPLOYEE_FILTER,
+              companyId: filter.companyId,
+              ...(filter.branchId ? { branchId: filter.branchId } : {}),
+            }),
+      ]);
+
+      const openPending = await LeaveRequest.find({
+        ...filter,
+        status: 'Pending',
+        appliedAt: { $lt: monthStart },
+      }).sort({ appliedAt: -1 });
+
+      const byId = new Map();
+      [...monthRequests, ...openPending].forEach((r) => byId.set(String(r._id), r));
+      const allVisible = [...byId.values()].sort(
+        (a, b) => new Date(b.appliedAt) - new Date(a.appliedAt),
+      );
+
+      const requests = await annotateRequests(req.user, allVisible.slice(0, 80));
+      const pending = requests.filter((r) => r.status === 'Pending').length;
+      const approved = monthRequests.filter((r) => r.status === 'Approved').length;
+      const rejected = monthRequests.filter((r) => r.status === 'Rejected').length;
+      const total = monthRequests.length;
+      const awaitingMe = requests.filter((r) => r.awaitingMe).length;
+
+      const usedByType = new Map();
+      yearApproved.forEach((r) => {
+        usedByType.set(r.leaveType, (usedByType.get(r.leaveType) || 0) + (r.days || 0));
+      });
+
+      const denom = Math.max(1, headcount);
+      const balances = POLICY.map((p) => {
+        const orgUsed = usedByType.get(p.type) || 0;
+        const used = selfOnly
+          ? Math.min(p.allotted, orgUsed)
+          : Math.min(p.allotted, Math.round((orgUsed / denom) * 10) / 10);
+        return {
+          type: p.type,
+          allotted: p.allotted,
+          used,
+          orgUsed,
+        };
+      });
+
+      return sendSuccess(res, {
+        periodLabel: new Date().toLocaleString('en-US', {
+          month: 'long',
+          year: 'numeric',
+        }),
+        summary: { pending, approved, rejected, total, awaitingMe },
+        split: [
+          { label: 'Approved', value: approved },
+          { label: 'Pending', value: pending },
+          { label: 'Rejected', value: rejected },
+        ],
+        balances,
+        requests,
+        leaveTypes: LEAVE_TYPES,
+        workflow: workflowLabel(),
+        canApprove: hasPermission(req.user.systemRole, 'approve_leave'),
+        canApplyForOthers: ['company_owner', 'super_admin', 'branch_head', 'hr'].includes(
+          req.user.systemRole,
+        ),
+        isSelfService: selfOnly,
+      });
+    } catch (err) {
+      return sendError(res, err.message, 500);
+    }
+  },
+);
+
+// GET /api/leave — list (optional ?status=&awaitingMe=1)
+router.get('/', protect, authorize('view_leave', 'view_own_leave'), async (req, res) => {
   try {
     const filter = await buildScopeFilter(req.user);
     if (!filter) return sendSuccess(res, { requests: [] });
@@ -231,17 +346,13 @@ router.get('/', protect, authorize('view_leave'), async (req, res) => {
     }
 
     const requests = await LeaveRequest.find(filter).sort({ appliedAt: -1 }).limit(100);
-    const userIds = [...new Set(requests.map((r) => String(r.userId)))];
-    const users = userIds.length
-      ? await User.find({
-          _id: { $in: userIds.map((id) => toObjectId(id)).filter(Boolean) },
-        }).select('name avatar dept employeeId')
-      : [];
-    const userMap = new Map(users.map((u) => [String(u._id), u]));
+    let mapped = await annotateRequests(req.user, requests);
 
-    return sendSuccess(res, {
-      requests: requests.map((r) => mapLeave(r, userMap)),
-    });
+    if (String(req.query.awaitingMe || '') === '1') {
+      mapped = mapped.filter((r) => r.awaitingMe);
+    }
+
+    return sendSuccess(res, { requests: mapped });
   } catch (err) {
     return sendError(res, err.message, 500);
   }
@@ -293,6 +404,32 @@ router.post('/', protect, authorize('apply_leave'), async (req, res) => {
       return sendError(res, 'Invalid date range');
     }
 
+    const chain = approvalChainForRequester(target.systemRole);
+    if (!chain.length) {
+      // CEO / no chain — auto approve
+      const leave = await LeaveRequest.create({
+        companyId: target.companyId,
+        branchId: target.branchId || null,
+        userId: target._id,
+        employeeId: target.employeeId,
+        leaveType,
+        startDate,
+        endDate,
+        days,
+        reason: reason || '',
+        status: 'Approved',
+        requesterRole: target.systemRole,
+        approvalChain: [],
+        currentApproverRole: null,
+        appliedAt: new Date(),
+        reviewedBy: req.user._id,
+        reviewedAt: new Date(),
+        reviewNote: 'Auto-approved (no further approver)',
+      });
+      const mapped = mapLeave(leave, new Map([[String(target._id), target]]));
+      return sendSuccess(res, { request: mapped }, 'Leave auto-approved', 201);
+    }
+
     const leave = await LeaveRequest.create({
       companyId: target.companyId,
       branchId: target.branchId || null,
@@ -304,78 +441,133 @@ router.post('/', protect, authorize('apply_leave'), async (req, res) => {
       days,
       reason: reason || '',
       status: 'Pending',
+      requesterRole: target.systemRole,
+      approvalChain: chain,
+      currentApproverRole: chain[0],
       appliedAt: new Date(),
     });
 
-    const mapped = mapLeave(leave, new Map([[String(target._id), target]]));
-    return sendSuccess(res, { request: mapped }, 'Leave request submitted', 201);
+    const mapped = mapLeave(leave, new Map([[String(target._id), target]]), {
+      awaitingMe: false,
+      canApprove: false,
+    });
+    return sendSuccess(
+      res,
+      { request: mapped },
+      `Leave submitted — awaiting ${APPROVER_ROLE_LABELS[chain[0]] || chain[0]}`,
+      201,
+    );
   } catch (err) {
     return sendError(res, err.message, 500);
   }
 });
 
-// PATCH /api/leave/:id/approve
-router.patch('/:id/approve', protect, authorize('approve_leave'), async (req, res) => {
+async function reviewLeave(req, res, action) {
   try {
     const leave = await LeaveRequest.findById(req.params.id);
     if (!leave) return sendError(res, 'Leave request not found', 404);
     if (leave.status !== 'Pending') {
-      return sendError(res, `Cannot approve a ${leave.status.toLowerCase()} request`);
+      return sendError(res, `Cannot ${action} a ${leave.status.toLowerCase()} request`);
     }
 
-    const filter = await buildScopeFilter(req.user);
-    if (!filter) return sendError(res, 'Forbidden', 403);
+    const requester = await User.findById(leave.userId).select(
+      'name avatar dept employeeId systemRole managerId teamId teamIds companyId branchId',
+    );
+    if (!requester) return sendError(res, 'Employee not found', 404);
 
-    const inScope = await LeaveRequest.findOne({ _id: leave._id, ...filter });
-    if (!inScope) return sendError(res, 'Forbidden', 403);
+    await ensureLeaveChainFields(leave, requester);
+
+    const allowed = await canActOnLeaveStage(req.user, leave, requester);
+    if (!allowed) {
+      return sendError(
+        res,
+        `Forbidden — waiting for ${APPROVER_ROLE_LABELS[leave.currentApproverRole] || leave.currentApproverRole || 'approver'}`,
+        403,
+      );
+    }
+
+    const note = req.body?.note || '';
+    const stage = leave.currentApproverRole;
+
+    leave.approvalHistory = [
+      ...(leave.approvalHistory || []),
+      {
+        role: stage,
+        userId: req.user._id,
+        action: action === 'approve' ? 'approved' : 'rejected',
+        note,
+        at: new Date(),
+      },
+    ];
+
+    if (action === 'reject') {
+      leave.status = 'Rejected';
+      leave.currentApproverRole = null;
+      leave.reviewedBy = req.user._id;
+      leave.reviewedAt = new Date();
+      leave.reviewNote = note;
+      await leave.save();
+      return sendSuccess(
+        res,
+        {
+          request: mapLeave(leave, new Map([[String(leave.userId), requester]]), {
+            canApprove: false,
+            awaitingMe: false,
+          }),
+        },
+        'Leave rejected',
+      );
+    }
+
+    const next = nextApproverRole(leave.approvalChain, stage);
+    if (next) {
+      leave.currentApproverRole = next;
+      leave.reviewedBy = req.user._id;
+      leave.reviewedAt = new Date();
+      leave.reviewNote = note;
+      await leave.save();
+      return sendSuccess(
+        res,
+        {
+          request: mapLeave(leave, new Map([[String(leave.userId), requester]]), {
+            canApprove: false,
+            awaitingMe: false,
+          }),
+        },
+        `Approved at ${APPROVER_ROLE_LABELS[stage] || stage} — now awaiting ${APPROVER_ROLE_LABELS[next] || next}`,
+      );
+    }
 
     leave.status = 'Approved';
+    leave.currentApproverRole = null;
     leave.reviewedBy = req.user._id;
     leave.reviewedAt = new Date();
-    leave.reviewNote = req.body?.note || '';
+    leave.reviewNote = note;
     await leave.save();
 
-    const user = await User.findById(leave.userId).select('name avatar dept employeeId');
     return sendSuccess(
       res,
-      { request: mapLeave(leave, new Map([[String(leave.userId), user]])) },
-      'Leave approved',
+      {
+        request: mapLeave(leave, new Map([[String(leave.userId), requester]]), {
+          canApprove: false,
+          awaitingMe: false,
+        }),
+      },
+      'Leave fully approved',
     );
   } catch (err) {
     return sendError(res, err.message, 500);
   }
-});
+}
+
+// PATCH /api/leave/:id/approve
+router.patch('/:id/approve', protect, authorize('approve_leave'), (req, res) =>
+  reviewLeave(req, res, 'approve'),
+);
 
 // PATCH /api/leave/:id/reject
-router.patch('/:id/reject', protect, authorize('approve_leave'), async (req, res) => {
-  try {
-    const leave = await LeaveRequest.findById(req.params.id);
-    if (!leave) return sendError(res, 'Leave request not found', 404);
-    if (leave.status !== 'Pending') {
-      return sendError(res, `Cannot reject a ${leave.status.toLowerCase()} request`);
-    }
-
-    const filter = await buildScopeFilter(req.user);
-    if (!filter) return sendError(res, 'Forbidden', 403);
-
-    const inScope = await LeaveRequest.findOne({ _id: leave._id, ...filter });
-    if (!inScope) return sendError(res, 'Forbidden', 403);
-
-    leave.status = 'Rejected';
-    leave.reviewedBy = req.user._id;
-    leave.reviewedAt = new Date();
-    leave.reviewNote = req.body?.note || '';
-    await leave.save();
-
-    const user = await User.findById(leave.userId).select('name avatar dept employeeId');
-    return sendSuccess(
-      res,
-      { request: mapLeave(leave, new Map([[String(leave.userId), user]])) },
-      'Leave rejected',
-    );
-  } catch (err) {
-    return sendError(res, err.message, 500);
-  }
-});
+router.patch('/:id/reject', protect, authorize('approve_leave'), (req, res) =>
+  reviewLeave(req, res, 'reject'),
+);
 
 module.exports = router;

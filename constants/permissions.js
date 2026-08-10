@@ -33,6 +33,7 @@ const PERMISSION_MATRIX = {
   // Attendance
   view_all_attendance: ['company_owner', 'super_admin', 'branch_head', 'hr', 'manager'],
   view_team_attendance: ['company_owner', 'super_admin', 'branch_head', 'hr', 'manager'],
+  view_own_attendance: 'all',
   clock_in: 'all',
   clock_out: 'all',
   break_in_out: 'all',
@@ -45,15 +46,26 @@ const PERMISSION_MATRIX = {
 
   // Settings / catering
   manage_system_settings: ['company_owner', 'super_admin'],
-  manage_catering: ['hr', 'branch_head'],
+  manage_catering: ['hr'],
+  /** Holiday calendar — Owner, Super Admin, HR */
+  manage_holidays: ['company_owner', 'super_admin', 'hr'],
+  view_holidays: 'all',
 
   // Leave
   view_leave: ['company_owner', 'super_admin', 'branch_head', 'hr', 'manager'],
+  view_own_leave: 'all',
   apply_leave: 'all',
   approve_leave: ['company_owner', 'super_admin', 'branch_head', 'hr', 'manager'],
 
   // Recruitment
   manage_recruitment: ['company_owner', 'super_admin', 'branch_head', 'hr'],
+  /** Account admin — change roles / activate / deactivate */
+  manage_users: ['company_owner', 'super_admin'],
+  /** Tasks — managers assign; everyone can view/update their own */
+  manage_tasks: ['company_owner', 'super_admin', 'branch_head', 'hr', 'manager'],
+  /** Any user can create a personal task for themselves */
+  create_own_task: 'all',
+  view_tasks: 'all',
 };
 
 const SYSTEM_ROLES = [

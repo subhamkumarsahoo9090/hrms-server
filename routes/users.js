@@ -11,7 +11,8 @@ const {
   canAssignToBranch,
   toObjectId,
 } = require('../utils/scope');
-const { sendSuccess, sendError, sanitizeUser } = require('../utils/helpers');
+const { sendSuccess, sendError, sanitizeUser, buildUserLookupFilter } = require('../utils/helpers');
+const { writeAudit } = require('../utils/audit');
 
 const router = express.Router();
 
@@ -71,7 +72,7 @@ router.get('/', protect, async (req, res) => {
       if (!companyIds.length) {
         return sendSuccess(res, {
           users: [],
-          totals: { users: 0, active: 0, privileged: 0, loggedInToday: 0 },
+          totals: { users: 0, active: 0, inactive: 0, privileged: 0, loggedInToday: 0 },
         });
       }
       filter = {
@@ -132,6 +133,7 @@ router.get('/', protect, async (req, res) => {
     const totals = {
       users: enriched.length,
       active: enriched.filter((u) => u.isActive !== false).length,
+      inactive: enriched.filter((u) => u.isActive === false).length,
       privileged: enriched.filter((u) => u.isPrivileged).length,
       loggedInToday: enriched.filter(
         (u) => u.lastLoginAt && new Date(u.lastLoginAt) >= todayStart,
@@ -194,6 +196,101 @@ router.post('/hr', protect, authorize('create_hr'), async (req, res) => {
     });
 
     return sendSuccess(res, { user: sanitizeUser(user) }, 'HR account created', 201);
+  } catch (err) {
+    return sendError(res, err.message, 500);
+  }
+});
+
+/**
+ * PATCH /api/users/:id
+ * Company Owner — change system role and/or active status.
+ * :id may be MongoDB ObjectId or employeeId (e.g. EMP005).
+ * Body: { systemRole?, isActive? }
+ */
+router.patch('/:id', protect, authorize('manage_users'), async (req, res) => {
+  try {
+    const lookup = buildUserLookupFilter(req.params.id);
+    const target = await User.findOne(lookup);
+    if (!target) return sendError(res, 'User not found', 404);
+
+    const companyIds = await resolveOwnerCompanyIds(req.user);
+    if (
+      !target.companyId ||
+      !companyIds.includes(String(target.companyId))
+    ) {
+      return sendError(res, 'You do not manage this user', 403);
+    }
+
+    if (String(target._id) === String(req.user._id)) {
+      if (req.body.isActive === false) {
+        return sendError(res, 'You cannot deactivate your own account', 400);
+      }
+      if (
+        req.body.systemRole !== undefined &&
+        req.body.systemRole !== target.systemRole
+      ) {
+        return sendError(res, 'You cannot change your own role', 400);
+      }
+    }
+
+    if (req.body.systemRole !== undefined) {
+      const nextRole = String(req.body.systemRole).trim();
+      const { SYSTEM_ROLES, ROLE_LABELS: labels } = require('../constants/permissions');
+      if (!SYSTEM_ROLES.includes(nextRole)) {
+        return sendError(res, 'Invalid system role');
+      }
+      if (nextRole === 'company_owner' && target.systemRole !== 'company_owner') {
+        return sendError(
+          res,
+          'Cannot assign Company Owner via this screen — use ownership transfer instead',
+          400,
+        );
+      }
+      target.systemRole = nextRole;
+      target.role = labels[nextRole] || nextRole.replace(/_/g, ' ');
+    }
+
+    if (req.body.isActive !== undefined) {
+      const active = !!req.body.isActive;
+      target.isActive = active;
+      target.status = active ? 'Active' : 'Inactive';
+    }
+
+    await target.save();
+
+    // Keep CompanyMembership role in sync when role changes
+    if (req.body.systemRole !== undefined && target.companyId) {
+      await CompanyMembership.updateMany(
+        { userId: target._id, companyId: target.companyId },
+        { $set: { systemRole: target.systemRole } },
+      );
+    }
+
+    const parts = [];
+    if (req.body.systemRole !== undefined) {
+      parts.push(`role → ${target.systemRole}`);
+    }
+    if (req.body.isActive !== undefined) {
+      parts.push(target.isActive ? 'activated' : 'deactivated');
+    }
+    if (parts.length) {
+      await writeAudit({
+        actor: req.user,
+        companyId: target.companyId,
+        action: `Updated ${target.name}: ${parts.join(', ')}`,
+        category: req.body.systemRole !== undefined ? 'permissions' : 'users',
+        entityType: 'user',
+        entityId: String(target._id),
+      });
+    }
+
+    return sendSuccess(
+      res,
+      { user: sanitizeUser(target) },
+      target.isActive
+        ? 'User updated'
+        : 'User deactivated — they can no longer sign in',
+    );
   } catch (err) {
     return sendError(res, err.message, 500);
   }
