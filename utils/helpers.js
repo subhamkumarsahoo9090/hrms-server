@@ -113,6 +113,26 @@ function validateShiftTimes(shiftStart, shiftEnd) {
   return null;
 }
 
+/** Next EMP### in this company (max existing number + 1). Avoids count-based collisions. */
+async function nextEmployeeId(User, companyId) {
+  const filter = { employeeId: { $regex: /^EMP\d+$/i } };
+  if (companyId) filter.companyId = companyId;
+  const users = await User.find(filter).select('employeeId').lean();
+  let max = 0;
+  for (const u of users) {
+    const n = parseInt(String(u.employeeId).replace(/\D/g, ''), 10);
+    if (!Number.isNaN(n) && n > max) max = n;
+  }
+  return `EMP${String(max + 1).padStart(3, '0')}`;
+}
+
+function duplicateKeyMessage(err) {
+  const key = err?.keyPattern || {};
+  if (key.email) return 'This email is already registered';
+  if (key.employeeId) return 'Employee ID already exists — retry create';
+  return 'Duplicate email or employee ID in this company';
+}
+
 module.exports = {
   formatTime,
   formatDate,
@@ -123,4 +143,6 @@ module.exports = {
   sanitizeUser,
   resolveAvatar,
   validateShiftTimes,
+  nextEmployeeId,
+  duplicateKeyMessage,
 };

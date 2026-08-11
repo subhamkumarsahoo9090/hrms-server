@@ -31,6 +31,8 @@ const {
   sanitizeUser,
   buildUserLookupFilter,
   validateShiftTimes,
+  nextEmployeeId,
+  duplicateKeyMessage,
 } = require('../utils/helpers');
 const { DEFAULT_SHIFT_START, DEFAULT_SHIFT_END } = require('../constants/shifts');
 
@@ -111,10 +113,6 @@ async function enrichEmployees(users) {
   });
 }
 
-async function generateEmployeeId(companyId) {
-  const count = await User.countDocuments({ companyId });
-  return `EMP${String(count + 1).padStart(3, '0')}`;
-}
 
 const DEPT_BY_ROLE = {
   hr: 'Human Resources',
@@ -325,20 +323,24 @@ router.post('/', protect, async (req, res) => {
       return sendError(res, 'Cannot create employee for another company', 403);
     }
 
-    // Resolve target branch — HR/branch_head forced to own branch
-    let targetBranchId = toObjectId(branchId) || req.user.branchId;
-    if (req.user.systemRole !== 'company_owner' && !canAssignToBranch(req.user, targetBranchId)) {
-      return sendError(
-        res,
-        'HR / Branch Head can only create employees in their own branch',
-        403,
-      );
-    }
-
-    // company_owner / super_admin must still pick a branch for branch-bound roles
+    // Super Admin / Company Owner are company-wide — never bind to a branch/dept/team
     const needsBranch = !['company_owner', 'super_admin'].includes(systemRole);
-    if (needsBranch && !targetBranchId) {
-      return sendError(res, 'branchId is required for this role');
+    let targetBranchId = needsBranch ? toObjectId(branchId) || req.user.branchId : null;
+    let targetDeptId = needsBranch ? toObjectId(departmentId) : null;
+    let targetTeamId = needsBranch ? toObjectId(teamId) : null;
+    let deptLabel = dept || DEPT_BY_ROLE[systemRole] || 'General';
+
+    if (needsBranch) {
+      if (req.user.systemRole !== 'company_owner' && !canAssignToBranch(req.user, targetBranchId)) {
+        return sendError(
+          res,
+          'HR / Branch Head can only create employees in their own branch',
+          403,
+        );
+      }
+      if (!targetBranchId) {
+        return sendError(res, 'branchId is required for this role');
+      }
     }
 
     if (targetBranchId) {
@@ -350,10 +352,6 @@ router.post('/', protect, async (req, res) => {
         return sendError(res, 'Branch not found in this company', 404);
       }
     }
-
-    let targetDeptId = toObjectId(departmentId);
-    let targetTeamId = toObjectId(teamId);
-    let deptLabel = dept || DEPT_BY_ROLE[systemRole] || 'General';
 
     if (targetDeptId) {
       const department = await Department.findOne({
@@ -387,9 +385,9 @@ router.post('/', protect, async (req, res) => {
 
     // Re-check branch after dept/team resolution (HR lock)
     if (
+      needsBranch &&
       req.user.systemRole !== 'company_owner' &&
-      !canAssignToBranch(req.user, targetBranchId) &&
-      needsBranch
+      !canAssignToBranch(req.user, targetBranchId)
     ) {
       return sendError(
         res,
@@ -411,7 +409,7 @@ router.post('/', protect, async (req, res) => {
       return sendError(res, shiftError);
     }
 
-    const employeeId = await generateEmployeeId(targetCompanyId);
+    const employeeId = await nextEmployeeId(User, targetCompanyId);
     const isHr = systemRole === 'hr';
 
     const user = await User.create({
@@ -436,12 +434,29 @@ router.post('/', protect, async (req, res) => {
       isActive: true,
     });
 
+    await CompanyMembership.findOneAndUpdate(
+      { userId: user._id, companyId: targetCompanyId },
+      {
+        userId: user._id,
+        companyId: targetCompanyId,
+        systemRole,
+        branchId: needsBranch ? targetBranchId || null : null,
+        isDefault: true,
+      },
+      { upsert: true, new: true },
+    );
+
     const [enriched] = await enrichEmployees([user]);
-    const message = isHr ? 'HR account created' : 'Employee created';
+    const message =
+      systemRole === 'super_admin'
+        ? 'Super Admin created'
+        : isHr
+          ? 'HR account created'
+          : 'Employee created';
     return sendSuccess(res, { employee: enriched }, message, 201);
   } catch (err) {
     if (err.code === 11000) {
-      return sendError(res, 'Duplicate email or employee ID in this company');
+      return sendError(res, duplicateKeyMessage(err));
     }
     return sendError(res, err.message, 500);
   }

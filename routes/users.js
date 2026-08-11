@@ -11,7 +11,13 @@ const {
   canAssignToBranch,
   toObjectId,
 } = require('../utils/scope');
-const { sendSuccess, sendError, sanitizeUser, buildUserLookupFilter } = require('../utils/helpers');
+const {
+  sendSuccess,
+  sendError,
+  sanitizeUser,
+  buildUserLookupFilter,
+  nextEmployeeId,
+} = require('../utils/helpers');
 const { writeAudit } = require('../utils/audit');
 
 const router = express.Router();
@@ -50,10 +56,6 @@ function startOfToday() {
   return d;
 }
 
-async function generateEmployeeId(companyId) {
-  const count = await User.countDocuments({ companyId });
-  return `EMP${String(count + 1).padStart(3, '0')}`;
-}
 
 // GET /api/users — login accounts visible to actor
 router.get('/', protect, async (req, res) => {
@@ -179,7 +181,7 @@ router.post('/hr', protect, authorize('create_hr'), async (req, res) => {
       return sendError(res, 'Email already registered in this company');
     }
 
-    const employeeId = await generateEmployeeId(req.user.companyId);
+    const employeeId = await nextEmployeeId(User, req.user.companyId);
 
     const user = await User.create({
       employeeId,

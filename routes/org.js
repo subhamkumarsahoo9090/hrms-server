@@ -44,6 +44,61 @@ function sanitizeCompany(c) {
   };
 }
 
+function sanitizeSuperAdmin(u) {
+  return {
+    id: String(u._id),
+    name: u.name,
+    email: u.email || '',
+    avatar: resolveAvatar(u.avatar, u.name),
+    employeeId: u.employeeId || '',
+  };
+}
+
+async function superAdminsByCompanyId(companyIds) {
+  if (!companyIds.length) return new Map();
+
+  const [direct, memberships] = await Promise.all([
+    User.find({
+      companyId: { $in: companyIds },
+      systemRole: 'super_admin',
+      isActive: { $ne: false },
+    })
+      .select('name email avatar employeeId companyId')
+      .sort({ name: 1 }),
+    CompanyMembership.find({
+      companyId: { $in: companyIds },
+      systemRole: 'super_admin',
+    }).select('userId companyId'),
+  ]);
+
+  const extraIds = [
+    ...new Set(memberships.map((m) => String(m.userId)).filter(Boolean)),
+  ];
+  const extraUsers = extraIds.length
+    ? await User.find({
+        _id: { $in: extraIds.map((id) => toObjectId(id)).filter(Boolean) },
+        isActive: { $ne: false },
+      }).select('name email avatar employeeId')
+    : [];
+
+  const userById = new Map();
+  for (const u of [...direct, ...extraUsers]) {
+    userById.set(String(u._id), u);
+  }
+
+  const byCompany = new Map();
+  function add(companyId, user) {
+    if (!companyId || !user) return;
+    const cid = String(companyId);
+    if (!byCompany.has(cid)) byCompany.set(cid, new Map());
+    byCompany.get(cid).set(String(user._id), sanitizeSuperAdmin(user));
+  }
+
+  for (const u of direct) add(u.companyId, u);
+  for (const m of memberships) add(m.companyId, userById.get(String(m.userId)));
+  return byCompany;
+}
+
 function sanitizeBranch(b) {
   const obj = b.toObject ? b.toObject() : { ...b };
   return {
@@ -136,6 +191,9 @@ function branchCodeFromCity(city, companyName) {
 }
 
 async function enrichCompanies(companies) {
+  const companyIds = companies.map((c) => c._id);
+  const saByCompany = await superAdminsByCompanyId(companyIds);
+
   return Promise.all(
     companies.map(async (c) => {
       const companyId = c._id;
@@ -143,10 +201,13 @@ async function enrichCompanies(companies) {
         Branch.countDocuments({ companyId }),
         User.countDocuments({ companyId, isActive: { $ne: false } }),
       ]);
+      const superAdmins = [...(saByCompany.get(String(companyId))?.values() || [])];
       return {
         ...sanitizeCompany(c),
         branchCount,
         employeeCount,
+        superAdmins,
+        superAdmin: superAdmins[0] || null,
       };
     }),
   );
@@ -188,6 +249,191 @@ router.get('/companies', protect, async (req, res) => {
         employees: totals.employees,
       },
       activeCompanyId: req.user.companyId ? String(req.user.companyId) : null,
+    });
+  } catch (err) {
+    return sendError(res, err.message, 500);
+  }
+});
+
+function mapOrgMember(m) {
+  return {
+    id: String(m._id),
+    employeeId: m.employeeId || '',
+    name: m.name,
+    role: m.role || '',
+    systemRole: m.systemRole || '',
+    dept: m.dept || '',
+    status: m.status || 'Active',
+    email: m.email || '',
+    phone: m.phone || '',
+    avatar: resolveAvatar(m.avatar, m.name),
+  };
+}
+
+/** If Team.managerId is empty, use a member whose systemRole is manager. */
+async function inferAndPersistTeamManager(team, memberDocs) {
+  if (team.managerId) return team.managerId;
+  const inferred = (memberDocs || []).find((m) => m.systemRole === 'manager');
+  if (!inferred?._id) return null;
+  await Team.updateOne(
+    { _id: team._id, $or: [{ managerId: null }, { managerId: { $exists: false } }] },
+    { $set: { managerId: inferred._id } },
+  );
+  team.managerId = inferred._id;
+  return inferred._id;
+}
+
+/**
+ * GET /api/org/companies/:id
+ * Full company snapshot: branches, departments, super admins, teams + heads + members.
+ */
+router.get('/companies/:id', protect, async (req, res) => {
+  try {
+    const companyId = toObjectId(req.params.id);
+    if (!companyId) return sendError(res, 'Invalid company id');
+
+    const company = await Company.findById(companyId);
+    if (!company) return sendError(res, 'Company not found', 404);
+
+    const allowed = await canAccessCompany(req.user, companyId);
+    if (!allowed) return sendError(res, 'You do not have access to this company', 403);
+
+    const branchFilter = { companyId };
+    if (isBranchScopedRole(req.user.systemRole) && req.user.branchId) {
+      branchFilter._id = req.user.branchId;
+    }
+
+    const deptFilter = { companyId };
+    const teamFilter = { companyId };
+    if (branchFilter._id) {
+      deptFilter.branchId = branchFilter._id;
+      teamFilter.branchId = branchFilter._id;
+    }
+
+    const [branches, departments, teams, saByCompany, employeeCount, owner] = await Promise.all([
+      Branch.find(branchFilter).sort({ isHeadOffice: -1, name: 1 }),
+      Department.find(deptFilter).sort({ name: 1 }),
+      Team.find(teamFilter).sort({ name: 1 }),
+      superAdminsByCompanyId([companyId]),
+      User.countDocuments({ companyId, isActive: { $ne: false } }),
+      company.ownerUserId
+        ? User.findById(company.ownerUserId).select('name email avatar employeeId role')
+        : null,
+    ]);
+
+    const superAdmins = [...(saByCompany.get(String(companyId))?.values() || [])];
+    const managerIds = [
+      ...new Set(teams.map((t) => (t.managerId ? String(t.managerId) : null)).filter(Boolean)),
+    ];
+
+    const [managers, usersInCompany] = await Promise.all([
+      managerIds.length
+        ? User.find({
+            _id: { $in: managerIds.map((id) => toObjectId(id)).filter(Boolean) },
+          }).select('name email avatar employeeId role systemRole phone dept status')
+        : Promise.resolve([]),
+      User.find({
+        companyId,
+        isActive: { $ne: false },
+        ...(branchFilter._id ? { branchId: branchFilter._id } : {}),
+      }).select(
+        'name email avatar employeeId role systemRole phone dept status branchId departmentId teamId teamIds',
+      ),
+    ]);
+
+    const managerById = new Map(managers.map((m) => [String(m._id), m]));
+    const branchById = new Map(branches.map((b) => [String(b._id), b]));
+    const deptById = new Map(departments.map((d) => [String(d._id), d]));
+
+    const branchRows = branches.map((b) => {
+      const bid = String(b._id);
+      const branchDepts = departments.filter((d) => String(d.branchId) === bid);
+      const branchTeams = teams.filter((t) => String(t.branchId) === bid);
+      const people = usersInCompany.filter((u) => u.branchId && String(u.branchId) === bid);
+      return {
+        ...sanitizeBranch(b),
+        departmentCount: branchDepts.length,
+        teamCount: branchTeams.length,
+        employeeCount: people.length,
+      };
+    });
+
+    const departmentRows = departments.map((d) => {
+      const did = String(d._id);
+      const branch = branchById.get(String(d.branchId));
+      const deptTeams = teams.filter((t) => String(t.departmentId) === did);
+      const people = usersInCompany.filter(
+        (u) => u.departmentId && String(u.departmentId) === did,
+      );
+      return {
+        ...sanitizeDepartment(d),
+        branchName: branch?.name || '',
+        branchCode: branch?.code || '',
+        teamCount: deptTeams.length,
+        employeeCount: people.length,
+      };
+    });
+
+    const teamRows = await Promise.all(teams.map(async (t) => {
+      const tid = String(t._id);
+      const members = usersInCompany.filter((u) =>
+        getUserTeamIdList(u).some((id) => String(id) === tid),
+      );
+      await inferAndPersistTeamManager(t, members);
+      const manager = t.managerId
+        ? managerById.get(String(t.managerId)) ||
+          members.find((m) => String(m._id) === String(t.managerId)) ||
+          null
+        : null;
+      const branch = branchById.get(String(t.branchId));
+      const dept = deptById.get(String(t.departmentId));
+      return {
+        ...sanitizeTeam(t),
+        departmentName: dept?.name || '',
+        branchName: branch?.name || '',
+        branchCode: branch?.code || '',
+        managerName: manager?.name || '',
+        managerEmail: manager?.email || '',
+        head: manager ? mapOrgMember(manager) : null,
+        memberCount: members.length,
+        members: members
+          .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+          .map(mapOrgMember),
+      };
+    }));
+
+    const [enrichedCompany] = await enrichCompanies([company]);
+
+    return sendSuccess(res, {
+      company: {
+        ...enrichedCompany,
+        departmentCount: departments.length,
+        teamCount: teams.length,
+        employeeCount,
+        superAdmins,
+        superAdmin: superAdmins[0] || null,
+        owner: owner
+          ? {
+              id: String(owner._id),
+              name: owner.name,
+              email: owner.email || '',
+              avatar: resolveAvatar(owner.avatar, owner.name),
+              employeeId: owner.employeeId || '',
+            }
+          : null,
+      },
+      branches: branchRows,
+      departments: departmentRows,
+      teams: teamRows,
+      superAdmins,
+      totals: {
+        branches: branches.length,
+        departments: departments.length,
+        teams: teams.length,
+        employees: employeeCount,
+        superAdmins: superAdmins.length,
+        teamMembers: teamRows.reduce((s, t) => s + (t.memberCount || 0), 0),
+      },
     });
   } catch (err) {
     return sendError(res, err.message, 500);
@@ -444,6 +690,128 @@ router.get('/branches', protect, async (req, res) => {
       branches: enriched,
       totals,
       activeCompanyId: req.user.companyId ? String(req.user.companyId) : null,
+    });
+  } catch (err) {
+    return sendError(res, err.message, 500);
+  }
+});
+
+/**
+ * GET /api/org/branches/:id
+ * Branch snapshot: departments, branch heads, teams + heads + members.
+ */
+router.get('/branches/:id', protect, async (req, res) => {
+  try {
+    const branchId = toObjectId(req.params.id);
+    if (!branchId) return sendError(res, 'Invalid branch id');
+
+    const branch = await Branch.findById(branchId);
+    if (!branch) return sendError(res, 'Branch not found', 404);
+
+    const allowed = await canAccessCompany(req.user, branch.companyId);
+    if (!allowed) {
+      return sendError(res, 'You do not have access to this branch', 403);
+    }
+    if (isBranchScopedRole(req.user.systemRole) && !canAssignToBranch(req.user, branch._id)) {
+      return sendError(res, 'You do not have access to this branch', 403);
+    }
+
+    const companyId = branch.companyId;
+    const [company, departments, teams, usersInBranch] = await Promise.all([
+      Company.findById(companyId),
+      Department.find({ companyId, branchId }).sort({ name: 1 }),
+      Team.find({ companyId, branchId }).sort({ name: 1 }),
+      User.find({
+        companyId,
+        branchId,
+        isActive: { $ne: false },
+      }).select(
+        'name email avatar employeeId role systemRole phone dept status branchId departmentId teamId teamIds',
+      ),
+    ]);
+
+    const managerIds = [
+      ...new Set(teams.map((t) => (t.managerId ? String(t.managerId) : null)).filter(Boolean)),
+    ];
+    const extraHeadIds = managerIds.filter(
+      (id) => !usersInBranch.some((u) => String(u._id) === id),
+    );
+    const extraHeads = extraHeadIds.length
+      ? await User.find({
+          _id: { $in: extraHeadIds.map((id) => toObjectId(id)).filter(Boolean) },
+        }).select('name email avatar employeeId role systemRole phone dept status')
+      : [];
+
+    const peopleById = new Map(
+      [...usersInBranch, ...extraHeads].map((u) => [String(u._id), u]),
+    );
+    const deptById = new Map(departments.map((d) => [String(d._id), d]));
+
+    const branchHeads = usersInBranch
+      .filter((u) => u.systemRole === 'branch_head')
+      .map(mapOrgMember);
+    const hrs = usersInBranch.filter((u) => u.systemRole === 'hr').map(mapOrgMember);
+
+    const departmentRows = departments.map((d) => {
+      const did = String(d._id);
+      const deptTeams = teams.filter((t) => String(t.departmentId) === did);
+      const people = usersInBranch.filter(
+        (u) => u.departmentId && String(u.departmentId) === did,
+      );
+      return {
+        ...sanitizeDepartment(d),
+        branchName: branch.name,
+        branchCode: branch.code,
+        teamCount: deptTeams.length,
+        employeeCount: people.length,
+      };
+    });
+
+    const teamRows = await Promise.all(teams.map(async (t) => {
+      const tid = String(t._id);
+      const members = usersInBranch.filter((u) =>
+        getUserTeamIdList(u).some((id) => String(id) === tid),
+      );
+      await inferAndPersistTeamManager(t, members);
+      const manager = t.managerId ? peopleById.get(String(t.managerId)) : null;
+      const dept = deptById.get(String(t.departmentId));
+      return {
+        ...sanitizeTeam(t),
+        departmentName: dept?.name || '',
+        branchName: branch.name,
+        branchCode: branch.code,
+        managerName: manager?.name || '',
+        managerEmail: manager?.email || '',
+        head: manager ? mapOrgMember(manager) : null,
+        memberCount: members.length,
+        members: members
+          .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+          .map(mapOrgMember),
+      };
+    }));
+
+    return sendSuccess(res, {
+      branch: {
+        ...sanitizeBranch(branch),
+        companyName: company?.name || '',
+        companySlug: company?.slug || '',
+        departmentCount: departments.length,
+        teamCount: teams.length,
+        employeeCount: usersInBranch.length,
+      },
+      company: company ? sanitizeCompany(company) : null,
+      branchHeads,
+      hrs,
+      departments: departmentRows,
+      teams: teamRows,
+      totals: {
+        departments: departments.length,
+        teams: teams.length,
+        employees: usersInBranch.length,
+        branchHeads: branchHeads.length,
+        hrs: hrs.length,
+        teamMembers: teamRows.reduce((s, t) => s + (t.memberCount || 0), 0),
+      },
     });
   } catch (err) {
     return sendError(res, err.message, 500);
@@ -718,6 +1086,126 @@ router.post('/departments', protect, authorize('create_department'), async (req,
 });
 
 /**
+ * GET /api/org/departments/:id
+ * Department snapshot: people, teams + heads + members.
+ */
+router.get('/departments/:id', protect, async (req, res) => {
+  try {
+    const departmentId = toObjectId(req.params.id);
+    if (!departmentId) return sendError(res, 'Invalid department id');
+
+    const department = await Department.findById(departmentId);
+    if (!department) return sendError(res, 'Department not found', 404);
+
+    const allowed = await canAccessCompany(req.user, department.companyId);
+    if (!allowed) {
+      return sendError(res, 'You do not have access to this department', 403);
+    }
+    if (isBranchScopedRole(req.user.systemRole) && !canAssignToBranch(req.user, department.branchId)) {
+      return sendError(res, 'You do not have access to this department', 403);
+    }
+
+    const nameRe = new RegExp(
+      `^${String(department.name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`,
+      'i',
+    );
+
+    const [branch, company, teams, usersInDept] = await Promise.all([
+      Branch.findById(department.branchId),
+      Company.findById(department.companyId),
+      Team.find({ departmentId }).sort({ name: 1 }),
+      User.find({
+        companyId: department.companyId,
+        isActive: { $ne: false },
+        $or: [
+          { departmentId },
+          {
+            departmentId: null,
+            branchId: department.branchId,
+            dept: nameRe,
+          },
+        ],
+      }).select(
+        'name email avatar employeeId role systemRole phone dept status branchId departmentId teamId teamIds',
+      ),
+    ]);
+
+    const managerIds = [
+      ...new Set(teams.map((t) => (t.managerId ? String(t.managerId) : null)).filter(Boolean)),
+    ];
+    const extraHeadIds = managerIds.filter(
+      (id) => !usersInDept.some((u) => String(u._id) === id),
+    );
+    const extraHeads = extraHeadIds.length
+      ? await User.find({
+          _id: { $in: extraHeadIds.map((id) => toObjectId(id)).filter(Boolean) },
+        }).select('name email avatar employeeId role systemRole phone dept status')
+      : [];
+
+    const peopleById = new Map(
+      [...usersInDept, ...extraHeads].map((u) => [String(u._id), u]),
+    );
+
+    const managers = usersInDept.filter((u) => u.systemRole === 'manager').map(mapOrgMember);
+
+    const teamRows = await Promise.all(teams.map(async (t) => {
+      const tid = String(t._id);
+      const members = usersInDept.filter((u) =>
+        getUserTeamIdList(u).some((id) => String(id) === tid),
+      );
+      await inferAndPersistTeamManager(t, members);
+      const manager = t.managerId ? peopleById.get(String(t.managerId)) : null;
+      return {
+        ...sanitizeTeam(t),
+        departmentName: department.name,
+        branchName: branch?.name || '',
+        branchCode: branch?.code || '',
+        managerName: manager?.name || '',
+        managerEmail: manager?.email || '',
+        head: manager ? mapOrgMember(manager) : null,
+        memberCount: members.length,
+        members: members
+          .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+          .map(mapOrgMember),
+      };
+    }));
+
+    return sendSuccess(res, {
+      department: {
+        ...sanitizeDepartment(department),
+        branchName: branch?.name || '',
+        branchCode: branch?.code || '',
+        companyName: company?.name || '',
+        companySlug: company?.slug || '',
+        employeeCount: usersInDept.length,
+        teamCount: teams.length,
+      },
+      branch: branch
+        ? {
+            ...sanitizeBranch(branch),
+            companyName: company?.name || '',
+            companySlug: company?.slug || '',
+          }
+        : null,
+      company: company ? sanitizeCompany(company) : null,
+      managers,
+      employees: usersInDept
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+        .map(mapOrgMember),
+      teams: teamRows,
+      totals: {
+        teams: teams.length,
+        employees: usersInDept.length,
+        managers: managers.length,
+        teamMembers: teamRows.reduce((s, t) => s + (t.memberCount || 0), 0),
+      },
+    });
+  } catch (err) {
+    return sendError(res, err.message, 500);
+  }
+});
+
+/**
  * DELETE /api/org/departments/:id
  * Same roles as create — blocked while employees or teams remain.
  */
@@ -873,7 +1361,16 @@ router.get('/teams', protect, async (req, res) => {
         const branch = branchById.get(String(t.branchId));
         const dept = deptById.get(String(t.departmentId));
         const company = companyById.get(String(t.companyId));
-        const manager = t.managerId ? managerById.get(String(t.managerId)) : null;
+        let manager = t.managerId ? managerById.get(String(t.managerId)) : null;
+        if (!manager) {
+          const inferredId = await inferAndPersistTeamManager(t, members);
+          if (inferredId) {
+            manager =
+              members.find((m) => String(m._id) === String(inferredId)) ||
+              managerById.get(String(inferredId)) ||
+              null;
+          }
+        }
 
         const memberPayload = members.map((m) => {
           const allTeamIds = getUserTeamIdList(m).map(String);
@@ -1018,6 +1515,11 @@ router.post('/teams/assign', protect, authorize('create_team', 'manage_companies
       addUserToTeam(user, team._id);
       if (!user.companyId) user.companyId = team.companyId;
       if (!user.branchId) user.branchId = team.branchId;
+    }
+
+    if (!team.managerId && user.systemRole === 'manager') {
+      team.managerId = user._id;
+      await team.save();
     }
 
     await user.save();
@@ -1231,6 +1733,14 @@ router.post('/teams', protect, authorize('create_team'), async (req, res) => {
       status: 'Active',
     });
 
+    if (resolvedManagerId) {
+      const mgrUser = await User.findById(resolvedManagerId);
+      if (mgrUser) {
+        addUserToTeam(mgrUser, team._id);
+        await mgrUser.save();
+      }
+    }
+
     const [branch, company, manager] = await Promise.all([
       Branch.findById(dept.branchId),
       Company.findById(targetCompanyId),
@@ -1259,6 +1769,58 @@ router.post('/teams', protect, authorize('create_team'), async (req, res) => {
     if (err.code === 11000) {
       return sendError(res, 'Team already exists in this department');
     }
+    return sendError(res, err.message, 500);
+  }
+});
+
+/**
+ * PATCH /api/org/teams/:id
+ * Set or clear the team head (managerId).
+ */
+router.patch('/teams/:id', protect, authorize('create_team', 'manage_companies'), async (req, res) => {
+  try {
+    const teamId = toObjectId(req.params.id);
+    if (!teamId) return sendError(res, 'Invalid team id');
+
+    const team = await Team.findById(teamId);
+    if (!team) return sendError(res, 'Team not found', 404);
+
+    const ownsTeamCompany = await canAccessCompany(req.user, team.companyId);
+    if (!ownsTeamCompany) {
+      return sendError(res, 'You do not have access to this team', 403);
+    }
+    if (isBranchScopedRole(req.user.systemRole) && !canAssignToBranch(req.user, team.branchId)) {
+      return sendError(res, 'You can only manage teams in your own branch', 403);
+    }
+
+    if (req.body.managerId === null || req.body.managerId === '') {
+      team.managerId = null;
+    } else if (req.body.managerId) {
+      const manager = await User.findOne(buildUserLookupFilter(req.body.managerId));
+      if (!manager || manager.isActive === false) {
+        return sendError(res, 'Manager not found', 404);
+      }
+      if (manager.companyId && String(manager.companyId) !== String(team.companyId)) {
+        return sendError(res, 'Manager must belong to the same company', 403);
+      }
+      addUserToTeam(manager, team._id);
+      await manager.save();
+      team.managerId = manager._id;
+    }
+
+    await team.save();
+    const mgr = team.managerId
+      ? await User.findById(team.managerId).select('name email')
+      : null;
+
+    return sendSuccess(res, {
+      team: {
+        ...sanitizeTeam(team),
+        managerName: mgr?.name || '',
+        managerEmail: mgr?.email || '',
+      },
+    }, mgr ? `${mgr.name} is now team manager` : 'Team manager cleared');
+  } catch (err) {
     return sendError(res, err.message, 500);
   }
 });
