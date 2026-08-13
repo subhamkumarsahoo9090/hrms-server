@@ -1269,13 +1269,16 @@ router.get(
               timeIn: { $exists: true, $ne: '' },
             }).select('userId status')
           : [],
-        LeaveRequest.find({
-          userId: { $in: memberIds.length ? memberIds : [req.user._id] },
-          status: 'Pending',
-        })
-          .populate('userId', 'name avatar')
-          .sort({ createdAt: -1 })
-          .limit(8),
+        memberIds.length
+          ? LeaveRequest.find({
+              userId: { $in: memberIds },
+              status: 'Pending',
+              currentApproverRole: 'manager',
+            })
+              .populate('userId', 'name avatar managerId teamId teamIds')
+              .sort({ createdAt: -1 })
+              .limit(8)
+          : Promise.resolve([]),
         Task.find({
           $or: [
             { assigneeId: { $in: [...memberIds, req.user._id] } },
@@ -1386,6 +1389,8 @@ router.get(
           days: l.days,
           duration: `${l.days} day(s)`,
           status: l.status,
+          currentApproverRole: l.currentApproverRole || 'manager',
+          canApprove: true,
         })),
         members: memberRows,
       });

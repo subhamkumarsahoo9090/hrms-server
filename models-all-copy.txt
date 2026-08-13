@@ -1,0 +1,1033 @@
+========== Absence.js ==========
+const mongoose = require('mongoose');
+
+const absenceSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    empId: { type: String, required: true },
+    name: { type: String, required: true },
+    dept: { type: String, required: true },
+    reason: { type: String, required: true },
+    avatar: { type: String, default: 'ðŸ‘¤' },
+    date: { type: String, required: true },
+  },
+  { timestamps: true }
+);
+
+absenceSchema.index({ empId: 1, date: 1 }, { unique: true });
+
+module.exports = mongoose.model('Absence', absenceSchema);
+
+
+========== AttendanceLog.js ==========
+const mongoose = require('mongoose');
+
+const attendanceLogSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    date: { type: String, required: true },
+    status: { type: String, default: 'Present' },
+    timeIn: { type: String, default: '' },
+    timeOut: { type: String, default: '' },
+    delayReason: { type: String, default: null },
+  },
+  { timestamps: true }
+);
+
+attendanceLogSchema.index({ userId: 1, date: 1 }, { unique: true });
+
+module.exports = mongoose.model('AttendanceLog', attendanceLogSchema);
+
+
+========== AuditLog.js ==========
+const mongoose = require('mongoose');
+
+const auditLogSchema = new mongoose.Schema(
+  {
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      default: null,
+      index: true,
+    },
+    actorId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    actorName: { type: String, default: 'System' },
+    action: { type: String, required: true },
+    category: {
+      type: String,
+      enum: ['config', 'users', 'permissions', 'org', 'payroll', 'leave', 'attendance', 'other'],
+      default: 'other',
+      index: true,
+    },
+    entityType: { type: String, default: '' },
+    entityId: { type: String, default: '' },
+    meta: { type: mongoose.Schema.Types.Mixed, default: {} },
+  },
+  { timestamps: true },
+);
+
+auditLogSchema.index({ createdAt: -1 });
+
+module.exports = mongoose.model('AuditLog', auditLogSchema);
+
+
+========== Branch.js ==========
+const mongoose = require('mongoose');
+
+const branchSchema = new mongoose.Schema(
+  {
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      required: true,
+      index: true,
+    },
+    name: { type: String, required: true, trim: true },
+    code: { type: String, required: true, trim: true, uppercase: true },
+    city: { type: String, default: '', trim: true },
+    address: { type: String, default: '', trim: true },
+    isHeadOffice: { type: Boolean, default: false },
+    status: {
+      type: String,
+      enum: ['Active', 'Inactive'],
+      default: 'Active',
+    },
+  },
+  { timestamps: true },
+);
+
+branchSchema.index({ companyId: 1, code: 1 }, { unique: true });
+
+module.exports = mongoose.model('Branch', branchSchema);
+
+
+========== BreakLog.js ==========
+const mongoose = require('mongoose');
+
+const breakSessionSchema = new mongoose.Schema(
+  {
+    startTime: { type: String, default: '' },
+    endTime: { type: String, default: '' },
+    durationSeconds: { type: Number, default: 0 },
+  },
+  { _id: false },
+);
+
+const breakLogSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    date: { type: String, required: true },
+    /** Current or last session start */
+    startTime: { type: String, default: '' },
+    /** Last session end */
+    endTime: { type: String, default: '' },
+    /** Total used today as HH:MM:SS */
+    duration: { type: String, default: '' },
+    /** not_started | active | available | completed */
+    status: { type: String, default: 'not_started' },
+    /** Seconds consumed in closed sessions only */
+    usedSeconds: { type: Number, default: 0 },
+    allowanceSeconds: { type: Number, default: 3600 },
+    sessions: { type: [breakSessionSchema], default: [] },
+  },
+  { timestamps: true },
+);
+
+breakLogSchema.index({ userId: 1, date: 1 }, { unique: true });
+
+module.exports = mongoose.model('BreakLog', breakLogSchema);
+
+
+========== Candidate.js ==========
+const mongoose = require('mongoose');
+
+const CANDIDATE_STAGES = [
+  'Applied',
+  'Shortlisted',
+  'Interviewed',
+  'Offer',
+  'Hired',
+  'Rejected',
+];
+
+const candidateSchema = new mongoose.Schema(
+  {
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      required: true,
+      index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      default: null,
+    },
+    jobId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'JobPosting',
+      required: true,
+      index: true,
+    },
+    name: { type: String, required: true, trim: true },
+    email: { type: String, required: true, lowercase: true, trim: true },
+    phone: { type: String, default: '' },
+    stage: {
+      type: String,
+      enum: CANDIDATE_STAGES,
+      default: 'Applied',
+      index: true,
+    },
+    interviewAt: { type: Date, default: null },
+    interviewStage: { type: String, default: '' },
+    notes: { type: String, default: '' },
+    offerSentAt: { type: Date, default: null },
+    hiredAt: { type: Date, default: null },
+  },
+  { timestamps: true },
+);
+
+candidateSchema.index({ jobId: 1, email: 1 }, { unique: true });
+
+module.exports = mongoose.model('Candidate', candidateSchema);
+module.exports.CANDIDATE_STAGES = CANDIDATE_STAGES;
+
+
+========== ChatMessage.js ==========
+const mongoose = require('mongoose');
+
+const chatMessageSchema = new mongoose.Schema(
+  {
+    sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    receiver: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    text: { type: String, required: true, trim: true, maxlength: 2000 },
+    read: { type: Boolean, default: false },
+  },
+  { timestamps: true }
+);
+
+chatMessageSchema.index({ sender: 1, receiver: 1, createdAt: -1 });
+chatMessageSchema.index({ receiver: 1, read: 1 });
+
+module.exports = mongoose.model('ChatMessage', chatMessageSchema);
+
+
+========== Company.js ==========
+const mongoose = require('mongoose');
+
+const companySchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    slug: { type: String, required: true, trim: true, lowercase: true, unique: true },
+    legalName: { type: String, default: '', trim: true },
+    status: {
+      type: String,
+      enum: ['Active', 'Inactive', 'Suspended'],
+      default: 'Active',
+    },
+    /** CEO / Company Owner user */
+    ownerUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    city: { type: String, default: '', trim: true },
+    address: { type: String, default: '', trim: true },
+    logo: { type: String, default: '' },
+  },
+  { timestamps: true },
+);
+
+module.exports = mongoose.model('Company', companySchema);
+
+
+========== CompanyMembership.js ==========
+const mongoose = require('mongoose');
+const { SYSTEM_ROLES } = require('../constants/permissions');
+
+/**
+ * Links a user to a company (CEO can own/access multiple companies).
+ * Active context on User.companyId / branchId is switched from these memberships.
+ */
+const companyMembershipSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+      index: true,
+    },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      required: true,
+      index: true,
+    },
+    systemRole: {
+      type: String,
+      enum: SYSTEM_ROLES,
+      required: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      default: null,
+    },
+    isDefault: { type: Boolean, default: false },
+  },
+  { timestamps: true },
+);
+
+companyMembershipSchema.index({ userId: 1, companyId: 1 }, { unique: true });
+
+module.exports = mongoose.model('CompanyMembership', companyMembershipSchema);
+
+
+========== CustomRole.js ==========
+const mongoose = require('mongoose');
+
+const customRoleSchema = new mongoose.Schema(
+  {
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      default: null,
+      index: true,
+    },
+    name: { type: String, required: true, trim: true },
+    description: { type: String, default: '' },
+    createdBy: { type: String, required: true },
+  },
+  { timestamps: true },
+);
+
+customRoleSchema.index(
+  { companyId: 1, name: 1 },
+  { unique: true, partialFilterExpression: { companyId: { $type: 'objectId' } } },
+);
+
+module.exports = mongoose.model('CustomRole', customRoleSchema);
+
+
+========== DelayRequest.js ==========
+const mongoose = require('mongoose');
+
+const delayRequestSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    empName: { type: String, required: true },
+    dept: { type: String, required: true },
+    requestedTime: { type: String, required: true },
+    reason: { type: String, required: true },
+    status: { type: String, enum: ['Pending', 'Approved', 'Rejected'], default: 'Pending' },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model('DelayRequest', delayRequestSchema);
+
+
+========== Department.js ==========
+const mongoose = require('mongoose');
+
+const departmentSchema = new mongoose.Schema(
+  {
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      required: true,
+      index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      required: true,
+      index: true,
+    },
+    name: { type: String, required: true, trim: true },
+    code: { type: String, default: '', trim: true, uppercase: true },
+    status: {
+      type: String,
+      enum: ['Active', 'Inactive'],
+      default: 'Active',
+    },
+  },
+  { timestamps: true },
+);
+
+departmentSchema.index({ branchId: 1, name: 1 }, { unique: true });
+
+module.exports = mongoose.model('Department', departmentSchema);
+
+
+========== Email.js ==========
+const mongoose = require('mongoose');
+
+const emailSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    from: { type: String, required: true },
+    subject: { type: String, required: true },
+    preview: { type: String, required: true },
+    body: { type: String, default: '' },
+    time: { type: String, default: '' },
+    unread: { type: Boolean, default: true },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model('Email', emailSchema);
+
+
+========== EmployeeDocument.js ==========
+const mongoose = require('mongoose');
+
+const employeeDocumentSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+      index: true,
+    },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      default: null,
+      index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      default: null,
+      index: true,
+    },
+    name: { type: String, required: true, trim: true },
+    type: {
+      type: String,
+      enum: ['Identity', 'Education', 'Banking', 'Offer', 'Other'],
+      default: 'Other',
+      index: true,
+    },
+    status: {
+      type: String,
+      enum: ['Pending', 'Verified', 'Rejected'],
+      default: 'Pending',
+      index: true,
+    },
+    notes: { type: String, default: '' },
+    uploadedBy: { type: String, default: '' },
+    reviewedBy: { type: String, default: '' },
+    reviewedAt: { type: Date, default: null },
+  },
+  { timestamps: true },
+);
+
+module.exports = mongoose.model('EmployeeDocument', employeeDocumentSchema);
+
+
+========== Holiday.js ==========
+const mongoose = require('mongoose');
+
+const holidaySchema = new mongoose.Schema(
+  {
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      required: true,
+      index: true,
+    },
+    /** Optional â€” if set, holiday applies only to that branch */
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      default: null,
+      index: true,
+    },
+    name: { type: String, required: true, trim: true },
+    /** ISO date YYYY-MM-DD */
+    date: { type: String, required: true, index: true },
+    optional: { type: Boolean, default: false },
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+  },
+  { timestamps: true },
+);
+
+holidaySchema.index({ companyId: 1, date: 1, name: 1 }, { unique: true });
+
+module.exports = mongoose.model('Holiday', holidaySchema);
+
+
+========== JobPosting.js ==========
+const mongoose = require('mongoose');
+
+const jobPostingSchema = new mongoose.Schema(
+  {
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      required: true,
+      index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      default: null,
+      index: true,
+    },
+    title: { type: String, required: true, trim: true },
+    department: { type: String, required: true, trim: true },
+    description: { type: String, default: '' },
+    openings: { type: Number, default: 1, min: 1 },
+    status: {
+      type: String,
+      enum: ['Active', 'Closed', 'On Hold'],
+      default: 'Active',
+      index: true,
+    },
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+  },
+  { timestamps: true },
+);
+
+module.exports = mongoose.model('JobPosting', jobPostingSchema);
+
+
+========== LeaveRequest.js ==========
+const mongoose = require('mongoose');
+
+const LEAVE_TYPES = ['Casual Leave', 'Sick Leave', 'Earned Leave', 'Comp Off', 'Maternity', 'Unpaid'];
+
+const approvalHistorySchema = new mongoose.Schema(
+  {
+    role: { type: String, default: '' },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    action: { type: String, enum: ['approved', 'rejected'], required: true },
+    note: { type: String, default: '' },
+    at: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
+const leaveRequestSchema = new mongoose.Schema(
+  {
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      required: true,
+      index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      default: null,
+      index: true,
+    },
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+      index: true,
+    },
+    employeeId: { type: String, required: true },
+    leaveType: {
+      type: String,
+      enum: LEAVE_TYPES,
+      required: true,
+    },
+    startDate: { type: String, required: true },
+    endDate: { type: String, required: true },
+    days: { type: Number, required: true, min: 0.5 },
+    reason: { type: String, default: '' },
+    status: {
+      type: String,
+      enum: ['Pending', 'Approved', 'Rejected', 'Cancelled'],
+      default: 'Pending',
+      index: true,
+    },
+    /** Requester systemRole at apply time */
+    requesterRole: { type: String, default: '' },
+    /** Remaining chain of approver roles, e.g. ['manager','hr'] */
+    approvalChain: { type: [String], default: [] },
+    /** Who must act next while Pending */
+    currentApproverRole: { type: String, default: null, index: true },
+    approvalHistory: { type: [approvalHistorySchema], default: [] },
+    appliedAt: { type: Date, default: Date.now },
+    reviewedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    reviewedAt: { type: Date, default: null },
+    reviewNote: { type: String, default: '' },
+  },
+  { timestamps: true },
+);
+
+leaveRequestSchema.index({ companyId: 1, status: 1, appliedAt: -1 });
+leaveRequestSchema.index({ currentApproverRole: 1, status: 1 });
+
+module.exports = mongoose.model('LeaveRequest', leaveRequestSchema);
+module.exports.LEAVE_TYPES = LEAVE_TYPES;
+
+
+========== LunchReservation.js ==========
+const mongoose = require('mongoose');
+
+const lunchReservationSchema = new mongoose.Schema(
+  {
+    date: { type: String, required: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    empId: { type: String, required: true },
+    name: { type: String, required: true },
+    dept: { type: String, required: true },
+    selection: { type: String, enum: ['Standard', 'Vegan', 'Opt-Out'], required: true },
+    notes: { type: String, default: '' },
+  },
+  { timestamps: true }
+);
+
+lunchReservationSchema.index({ userId: 1, date: 1 }, { unique: true });
+
+module.exports = mongoose.model('LunchReservation', lunchReservationSchema);
+
+
+========== Menu.js ==========
+const mongoose = require('mongoose');
+
+const menuSchema = new mongoose.Schema(
+  {
+    date: { type: String, required: true, unique: true },
+    catalogItemIds: [
+      { type: mongoose.Schema.Types.ObjectId, ref: 'MenuCatalog' },
+    ],
+    menuCardId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'MenuCard',
+      default: null,
+    },
+    // Legacy fields kept for backward compatibility during migration
+    mainCourse: { type: String, default: '' },
+    sides: { type: String, default: '' },
+    dessert: { type: String, default: '' },
+    veganOption: { type: String, default: '' },
+    updatedBy: { type: String, default: '' },
+    lastUpdated: { type: String, default: '' },
+    isLunchActive: { type: Boolean, default: true },
+  },
+  { timestamps: true },
+);
+
+module.exports = mongoose.model('Menu', menuSchema);
+
+
+========== MenuCard.js ==========
+const mongoose = require('mongoose');
+
+/**
+ * Reusable lunch menu "card" â€” HR builds cards from catalog dishes,
+ * then schedules a card onto one or more calendar dates.
+ */
+const menuCardSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    description: { type: String, default: '', trim: true },
+    catalogItemIds: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MenuCatalog' }],
+      default: [],
+    },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      default: null,
+      index: true,
+    },
+    isActive: { type: Boolean, default: true },
+    createdBy: { type: String, default: '' },
+    createdById: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+  },
+  { timestamps: true },
+);
+
+menuCardSchema.index({ name: 1, companyId: 1 });
+
+module.exports = mongoose.model('MenuCard', menuCardSchema);
+
+
+========== MenuCatalog.js ==========
+const mongoose = require('mongoose');
+
+const menuCatalogSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    category: {
+      type: String,
+      enum: ['main', 'side', 'dessert', 'vegan'],
+      required: true,
+    },
+    description: { type: String, default: '', trim: true },
+    emoji: { type: String, default: 'ðŸ½ï¸' },
+    isActive: { type: Boolean, default: true },
+    createdBy: { type: String, default: '' },
+  },
+  { timestamps: true },
+);
+
+menuCatalogSchema.index({ category: 1, name: 1 });
+
+module.exports = mongoose.model('MenuCatalog', menuCatalogSchema);
+
+
+========== MenuFeedback.js ==========
+const mongoose = require('mongoose');
+
+const menuFeedbackSchema = new mongoose.Schema(
+  {
+    itemId: { type: String, required: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    employeeName: { type: String, required: true },
+    dept: { type: String, required: true },
+    liked: { type: Boolean, default: true },
+    comment: { type: String, default: '' },
+    time: { type: String, default: '' },
+    date: { type: String, default: '', index: true },
+  },
+  { timestamps: true },
+);
+
+menuFeedbackSchema.index({ userId: 1, itemId: 1, date: 1 }, { unique: true });
+
+module.exports = mongoose.model('MenuFeedback', menuFeedbackSchema);
+
+
+========== Message.js ==========
+const mongoose = require('mongoose');
+
+const messageSchema = new mongoose.Schema(
+  {
+    from: { type: String, required: true },
+    fromUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    subject: { type: String, required: true },
+    preview: { type: String, required: true },
+    body: { type: String, default: '' },
+    time: { type: String, default: '' },
+    unread: { type: Boolean, default: true },
+    isBroadcast: { type: Boolean, default: false },
+    recipients: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model('Message', messageSchema);
+
+
+========== NotificationDismissal.js ==========
+const mongoose = require('mongoose');
+
+const notificationDismissalSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    key: { type: String, required: true },
+    dismissedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: false },
+);
+
+notificationDismissalSchema.index({ userId: 1, key: 1 }, { unique: true });
+
+module.exports = mongoose.model('NotificationDismissal', notificationDismissalSchema);
+
+
+========== Onboarding.js ==========
+const mongoose = require('mongoose');
+
+const checklistItemSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true },
+    label: { type: String, required: true },
+    mandatory: { type: Boolean, default: true },
+    done: { type: Boolean, default: false },
+    completedAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
+const onboardingSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+      unique: true,
+      index: true,
+    },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      default: null,
+      index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      default: null,
+      index: true,
+    },
+    status: {
+      type: String,
+      enum: ['In Progress', 'Completed'],
+      default: 'In Progress',
+      index: true,
+    },
+    checklist: { type: [checklistItemSchema], default: [] },
+    joinedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true },
+);
+
+module.exports = mongoose.model('Onboarding', onboardingSchema);
+
+
+========== SalarySlip.js ==========
+const mongoose = require('mongoose');
+
+const salarySlipSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    month: { type: String, required: true },
+    basic: { type: Number, required: true },
+    allowances: { type: Number, default: 0 },
+    bonus: { type: Number, default: 0 },
+    tax: { type: Number, default: 0 },
+    pf: { type: Number, default: 0 },
+    net: { type: Number, required: true },
+  },
+  { timestamps: true }
+);
+
+salarySlipSchema.index({ userId: 1, month: 1 }, { unique: true });
+
+module.exports = mongoose.model('SalarySlip', salarySlipSchema);
+
+
+========== SystemSettings.js ==========
+const mongoose = require('mongoose');
+
+const systemSettingsSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true, unique: true },
+    value: { type: mongoose.Schema.Types.Mixed, required: true },
+    updatedBy: { type: String, default: 'Super Admin' },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model('SystemSettings', systemSettingsSchema);
+
+
+========== Task.js ==========
+const mongoose = require('mongoose');
+
+const taskSchema = new mongoose.Schema(
+  {
+    title: { type: String, required: true, trim: true },
+    description: { type: String, default: '' },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      default: null,
+      index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      default: null,
+      index: true,
+    },
+    teamId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Team',
+      default: null,
+      index: true,
+    },
+    assigneeId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+      index: true,
+    },
+    assignerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    priority: {
+      type: String,
+      enum: ['High', 'Medium', 'Low'],
+      default: 'Medium',
+      index: true,
+    },
+    status: {
+      type: String,
+      enum: ['Pending', 'In Progress', 'Completed'],
+      default: 'Pending',
+      index: true,
+    },
+    dueDate: { type: String, default: '' },
+  },
+  { timestamps: true },
+);
+
+module.exports = mongoose.model('Task', taskSchema);
+
+
+========== Team.js ==========
+const mongoose = require('mongoose');
+
+const teamSchema = new mongoose.Schema(
+  {
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      required: true,
+      index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      required: true,
+      index: true,
+    },
+    departmentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Department',
+      required: true,
+      index: true,
+    },
+    name: { type: String, required: true, trim: true },
+    managerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    status: {
+      type: String,
+      enum: ['Active', 'Inactive'],
+      default: 'Active',
+    },
+  },
+  { timestamps: true },
+);
+
+teamSchema.index({ departmentId: 1, name: 1 }, { unique: true });
+
+module.exports = mongoose.model('Team', teamSchema);
+
+
+========== User.js ==========
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const { SYSTEM_ROLES } = require('../constants/permissions');
+const { DEFAULT_SHIFT_START, DEFAULT_SHIFT_END } = require('../constants/shifts');
+
+const userSchema = new mongoose.Schema(
+  {
+    employeeId: { type: String, required: true },
+    name: { type: String, required: true, trim: true },
+    email: { type: String, required: true, lowercase: true, trim: true },
+    password: { type: String, required: true, minlength: 6, select: false },
+    role: { type: String, required: true },
+    systemRole: { type: String, enum: SYSTEM_ROLES, required: true },
+    /** Display label (kept for backwards compatibility) */
+    dept: { type: String, required: true },
+
+    /** Org scope â€” multi-company / multi-branch */
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      default: null,
+      index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      default: null,
+      index: true,
+    },
+    departmentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Department',
+      default: null,
+      index: true,
+    },
+    /** Primary / home team (backwards compatible) */
+    teamId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Team',
+      default: null,
+      index: true,
+    },
+    /** All teams this user belongs to (multi-team) */
+    teamIds: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Team' }],
+      default: [],
+      index: true,
+    },
+    managerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+
+    status: { type: String, default: 'Active' },
+    avatar: { type: String, default: 'ðŸ‘¤' },
+    lastLoginAt: { type: Date, default: null },
+    delayCount: { type: Number, default: 0 },
+    salary: { type: Number, default: 0 },
+    phone: { type: String, default: '', trim: true },
+    shiftStart: { type: String, default: DEFAULT_SHIFT_START },
+    shiftEnd: { type: String, default: DEFAULT_SHIFT_END },
+    customRoleId: { type: mongoose.Schema.Types.ObjectId, ref: 'CustomRole', default: null },
+    isActive: { type: Boolean, default: true },
+  },
+  { timestamps: true },
+);
+
+/** Unique email + employeeId per company (global unique removed for multi-company SaaS) */
+userSchema.index(
+  { companyId: 1, email: 1 },
+  { unique: true, partialFilterExpression: { companyId: { $type: 'objectId' } } },
+);
+userSchema.index(
+  { companyId: 1, employeeId: 1 },
+  { unique: true, partialFilterExpression: { companyId: { $type: 'objectId' } } },
+);
+
+userSchema.pre('save', async function hashPassword() {
+  if (!this.isModified('password')) return;
+  this.password = await bcrypt.hash(this.password, 12);
+});
+
+userSchema.methods.comparePassword = function comparePassword(candidate) {
+  return bcrypt.compare(candidate, this.password);
+};
+
+module.exports = mongoose.model('User', userSchema);
+
+

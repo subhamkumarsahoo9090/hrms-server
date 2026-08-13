@@ -145,6 +145,28 @@ async function findEmployee(id, companyId) {
   return User.findOne(filter);
 }
 
+/** Owner can manage any owned company; others use canAccessEmployee */
+async function findManageableEmployee(actor, id) {
+  if (actor.systemRole === 'company_owner') {
+    const employee = await findEmployee(id, null);
+    if (!employee) return null;
+    const owned = await resolveOwnerCompanyIds(actor);
+    if (!employee.companyId || !owned.includes(String(employee.companyId))) {
+      return null;
+    }
+    return employee;
+  }
+
+  const employee = await findEmployee(id, actor.companyId);
+  if (!employee) return null;
+  if (!canAccessEmployee(actor, employee)) return null;
+  return employee;
+}
+
+function canEditFullProfile(actorRole) {
+  return ['company_owner', 'super_admin', 'hr'].includes(actorRole);
+}
+
 async function purgeUserData(userId) {
   await Promise.all([
     AttendanceLog.deleteMany({ userId }),
@@ -462,17 +484,46 @@ router.post('/', protect, async (req, res) => {
   }
 });
 
-// PATCH /api/employees/:id
+// PATCH /api/employees/:id — Owner / Super Admin / HR (and other edit_employees) update user data
 router.patch('/:id', protect, authorize('edit_employees'), async (req, res) => {
   try {
-    const employee = await findEmployee(req.params.id, req.user.companyId);
-
+    const employee = await findManageableEmployee(req.user, req.params.id);
     if (!employee) {
-      return sendError(res, 'Employee not found', 404);
+      return sendError(res, 'Employee not found or outside your scope', 404);
     }
 
-    if (!canAccessEmployee(req.user, employee)) {
-      return sendError(res, 'Forbidden — out of your org scope', 403);
+    const fullEdit = canEditFullProfile(req.user.systemRole);
+
+    // Role changes — only owner / SA / HR, and only roles they may create (or keep current)
+    if (req.body.systemRole !== undefined && req.body.systemRole !== employee.systemRole) {
+      if (!fullEdit) {
+        return sendError(res, 'Forbidden — cannot change system role', 403);
+      }
+      const nextRole = String(req.body.systemRole);
+      const ok =
+        resolveCreatePermission(req.user.systemRole, nextRole) ||
+        (req.user.systemRole === 'company_owner' && nextRole === 'super_admin') ||
+        (req.user.systemRole === 'super_admin' && nextRole === 'super_admin');
+      if (!ok) {
+        return sendError(res, `Forbidden — cannot assign role: ${nextRole}`, 403);
+      }
+      // HR cannot promote to branch_head / super_admin / hr above themselves
+      if (
+        req.user.systemRole === 'hr' &&
+        ['company_owner', 'super_admin', 'branch_head', 'hr'].includes(nextRole)
+      ) {
+        return sendError(res, 'HR cannot assign this role', 403);
+      }
+      employee.systemRole = nextRole;
+      if (!req.body.role) {
+        employee.role = ROLE_LABELS[nextRole] || nextRole;
+      }
+      if (['company_owner', 'super_admin'].includes(nextRole)) {
+        employee.branchId = null;
+        employee.departmentId = null;
+        employee.teamId = null;
+        employee.teamIds = [];
+      }
     }
 
     const allowed = [
@@ -481,24 +532,43 @@ router.patch('/:id', protect, authorize('edit_employees'), async (req, res) => {
       'dept',
       'status',
       'avatar',
-      'systemRole',
       'shiftStart',
       'shiftEnd',
       'departmentId',
       'teamId',
       'managerId',
+      'phone',
     ];
+    if (fullEdit) {
+      allowed.push('email');
+    }
     if (hasPermission(req.user.systemRole, 'manage_salary')) {
       allowed.push('salary');
     }
 
-    // Branch change only for company-wide roles
+    // Branch change — Super Admin stays company-wide (no branch)
     if (req.body.branchId !== undefined) {
-      const newBranchId = toObjectId(req.body.branchId);
-      if (!canAssignToBranch(req.user, newBranchId)) {
-        return sendError(res, 'Cannot move employee to another branch', 403);
+      if (['company_owner', 'super_admin'].includes(employee.systemRole)) {
+        employee.branchId = null;
+      } else {
+        const newBranchId = toObjectId(req.body.branchId) || null;
+        if (newBranchId) {
+          const branch = await Branch.findById(newBranchId);
+          if (!branch) return sendError(res, 'Branch not found', 404);
+          if (String(branch.companyId) !== String(employee.companyId)) {
+            return sendError(res, 'Branch must belong to the employee company', 403);
+          }
+          if (req.user.systemRole === 'company_owner') {
+            const owned = await resolveOwnerCompanyIds(req.user);
+            if (!owned.includes(String(branch.companyId))) {
+              return sendError(res, 'Cannot move employee to another branch', 403);
+            }
+          } else if (!canAssignToBranch(req.user, newBranchId)) {
+            return sendError(res, 'Cannot move employee to another branch', 403);
+          }
+        }
+        employee.branchId = newBranchId;
       }
-      employee.branchId = newBranchId;
     }
 
     const shiftError = validateShiftTimes(req.body.shiftStart, req.body.shiftEnd);
@@ -506,15 +576,40 @@ router.patch('/:id', protect, authorize('edit_employees'), async (req, res) => {
       return sendError(res, shiftError);
     }
 
+    if (req.body.email !== undefined && fullEdit) {
+      const nextEmail = String(req.body.email).toLowerCase().trim();
+      if (!nextEmail) return sendError(res, 'Email is required');
+      if (nextEmail !== employee.email) {
+        const clash = await User.findOne({
+          companyId: employee.companyId,
+          email: nextEmail,
+          _id: { $ne: employee._id },
+        }).select('_id');
+        if (clash) return sendError(res, 'Email already registered in this company');
+        employee.email = nextEmail;
+      }
+    }
+
     allowed.forEach((field) => {
+      if (field === 'email') return; // handled above
       if (req.body[field] !== undefined) {
         if (['departmentId', 'teamId', 'managerId'].includes(field)) {
-          employee[field] = toObjectId(req.body[field]);
+          employee[field] = toObjectId(req.body[field]) || null;
+        } else if (field === 'salary') {
+          employee.salary = Number(req.body.salary) || 0;
         } else {
           employee[field] = req.body[field];
         }
       }
     });
+
+    if (req.body.dept === undefined && req.body.departmentId !== undefined) {
+      const deptId = toObjectId(req.body.departmentId);
+      if (deptId) {
+        const dept = await Department.findById(deptId).select('name');
+        if (dept?.name) employee.dept = dept.name;
+      }
+    }
 
     if (req.body.teamId !== undefined) {
       const tid = toObjectId(req.body.teamId);
@@ -533,11 +628,22 @@ router.patch('/:id', protect, authorize('edit_employees'), async (req, res) => {
       if (!employee.status || employee.status === 'Inactive') {
         employee.status = 'Active';
       }
+    } else if (req.body.isActive === false && fullEdit) {
+      employee.isActive = false;
+      employee.status = 'Inactive';
+    }
+
+    if (fullEdit && req.body.status !== undefined) {
+      const st = String(req.body.status);
+      employee.status = st;
+      if (st === 'Inactive') employee.isActive = false;
+      if (st === 'Active') employee.isActive = true;
     }
 
     await employee.save();
 
-    return sendSuccess(res, { employee: sanitizeUser(employee) }, 'Employee updated');
+    const [enriched] = await enrichEmployees([employee]);
+    return sendSuccess(res, { employee: enriched }, 'Employee updated');
   } catch (err) {
     return sendError(res, err.message, 500);
   }
@@ -549,14 +655,9 @@ router.patch(
   authorize('reset_employee_password'),
   async (req, res) => {
     try {
-      const employee = await findEmployee(req.params.id, req.user.companyId);
-
+      const employee = await findManageableEmployee(req.user, req.params.id);
       if (!employee) {
-        return sendError(res, 'Employee not found', 404);
-      }
-
-      if (!canAccessEmployee(req.user, employee)) {
-        return sendError(res, 'Cannot reset password for this account', 403);
+        return sendError(res, 'Employee not found or outside your scope', 404);
       }
 
       const { password } = req.body;
@@ -576,21 +677,17 @@ router.patch(
 
 router.patch('/:id/reactivate', protect, authorize('edit_employees'), async (req, res) => {
   try {
-    const employee = await findEmployee(req.params.id, req.user.companyId);
-
+    const employee = await findManageableEmployee(req.user, req.params.id);
     if (!employee) {
-      return sendError(res, 'Employee not found', 404);
-    }
-
-    if (!canAccessEmployee(req.user, employee)) {
-      return sendError(res, 'Forbidden — out of your org scope', 403);
+      return sendError(res, 'Employee not found or outside your scope', 404);
     }
 
     employee.isActive = true;
     employee.status = req.body.status || 'Active';
     await employee.save();
 
-    return sendSuccess(res, { employee: sanitizeUser(employee) }, 'Employee reactivated');
+    const [enriched] = await enrichEmployees([employee]);
+    return sendSuccess(res, { employee: enriched }, 'Employee reactivated');
   } catch (err) {
     return sendError(res, err.message, 500);
   }
@@ -598,14 +695,9 @@ router.patch('/:id/reactivate', protect, authorize('edit_employees'), async (req
 
 router.patch('/:id/deactivate', protect, authorize('delete_employees'), async (req, res) => {
   try {
-    const employee = await findEmployee(req.params.id, req.user.companyId);
-
+    const employee = await findManageableEmployee(req.user, req.params.id);
     if (!employee) {
-      return sendError(res, 'Employee not found', 404);
-    }
-
-    if (!canAccessEmployee(req.user, employee)) {
-      return sendError(res, 'Forbidden — out of your org scope', 403);
+      return sendError(res, 'Employee not found or outside your scope', 404);
     }
 
     if (employee._id.toString() === req.user._id.toString()) {
@@ -624,14 +716,9 @@ router.patch('/:id/deactivate', protect, authorize('delete_employees'), async (r
 
 router.delete('/:id', protect, authorize('delete_employees'), async (req, res) => {
   try {
-    const employee = await findEmployee(req.params.id, req.user.companyId);
-
+    const employee = await findManageableEmployee(req.user, req.params.id);
     if (!employee) {
-      return sendError(res, 'Employee not found', 404);
-    }
-
-    if (!canAccessEmployee(req.user, employee)) {
-      return sendError(res, 'Forbidden — out of your org scope', 403);
+      return sendError(res, 'Employee not found or outside your scope', 404);
     }
 
     if (employee._id.toString() === req.user._id.toString()) {

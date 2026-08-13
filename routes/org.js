@@ -16,8 +16,9 @@ const {
   isBranchScopedRole,
   isTeamScopedRole,
 } = require('../constants/permissions');
-const { canAssignToBranch, assertSameCompany, toObjectId } = require('../utils/scope');
+const { canAssignToBranch, assertSameCompany, toObjectId, buildUserScopeFilter } = require('../utils/scope');
 const { sendSuccess, sendError, resolveAvatar, buildUserLookupFilter } = require('../utils/helpers');
+const { ATTENDANCE_SCOPE_FILTER } = require('../utils/absences');
 const {
   teamMemberFilter,
   getUserTeamIdList,
@@ -1967,6 +1968,388 @@ router.get('/tree', protect, async (req, res) => {
       branches: branches.map(sanitizeBranch),
       departments: departments.map(sanitizeDepartment),
       teams: teams.map(sanitizeTeam),
+    });
+  } catch (err) {
+    return sendError(res, err.message, 500);
+  }
+});
+
+const ROLE_RANK = {
+  company_owner: 0,
+  super_admin: 1,
+  branch_head: 2,
+  hr: 3,
+  manager: 4,
+  developer: 5,
+  sales: 5,
+  designer: 5,
+  accountant: 5,
+  marketing: 5,
+  custom: 6,
+};
+
+function roleRank(systemRole) {
+  if (ROLE_RANK[systemRole] != null) return ROLE_RANK[systemRole];
+  return 7;
+}
+
+async function resolveOwnerCompanyIdsForOrg(user) {
+  const memberships = await CompanyMembership.find({ userId: user._id });
+  const owned = await Company.find({ ownerUserId: user._id });
+  return [
+    ...new Set(
+      [
+        ...memberships.map((m) => String(m.companyId)),
+        ...owned.map((c) => String(c._id)),
+        user.companyId ? String(user.companyId) : null,
+      ].filter(Boolean),
+    ),
+  ];
+}
+
+/**
+ * GET /api/org/reporting-hierarchy
+ * Dynamic people tree — managerId links + structural Owner → SA → Branch Head…
+ * Includes company owners and super admins. Also returns branch-grouped trees.
+ */
+router.get('/reporting-hierarchy', protect, async (req, res) => {
+  try {
+    let filter = { ...ATTENDANCE_SCOPE_FILTER };
+    let scopeLabel = 'Personal';
+    let scopedCompanyIds = [];
+
+    if (req.user.systemRole === 'company_owner') {
+      scopedCompanyIds = await resolveOwnerCompanyIdsForOrg(req.user);
+      if (!scopedCompanyIds.length) {
+        return sendSuccess(res, {
+          roots: [],
+          branches: [],
+          people: 0,
+          scope: 'All owned companies',
+          scopeLabel: 'All owned companies',
+        });
+      }
+      filter.companyId = {
+        $in: scopedCompanyIds.map((id) => toObjectId(id)).filter(Boolean),
+      };
+      scopeLabel = 'All owned companies';
+      const qCompanyId = toObjectId(req.query.companyId);
+      if (qCompanyId) {
+        if (!scopedCompanyIds.includes(String(qCompanyId))) {
+          return sendError(res, 'You do not have access to this company', 403);
+        }
+        filter.companyId = qCompanyId;
+        scopedCompanyIds = [String(qCompanyId)];
+        scopeLabel = 'Selected company';
+      }
+    } else {
+      const scope = buildUserScopeFilter(req.user);
+      filter = { ...filter, ...scope };
+      if (req.user.companyId) scopedCompanyIds = [String(req.user.companyId)];
+      if (isCompanyWideRole(req.user.systemRole)) scopeLabel = 'Company-wide';
+      else if (isBranchScopedRole(req.user.systemRole)) scopeLabel = 'Your branch';
+      else if (isTeamScopedRole(req.user.systemRole)) scopeLabel = 'Your team';
+      else scopeLabel = 'Your reporting line';
+    }
+
+    let users = await User.find(filter)
+      .select(
+        'name role systemRole dept employeeId avatar managerId companyId branchId departmentId teamId status isActive',
+      )
+      .sort({ name: 1 });
+
+    let companyById = new Map();
+
+    // Always pull company owners + super admins for scoped companies (even if
+    // owner's active companyId points elsewhere)
+    if (scopedCompanyIds.length) {
+      const companyDocs = await Company.find({
+        _id: { $in: scopedCompanyIds.map((id) => toObjectId(id)).filter(Boolean) },
+      }).select('_id name slug ownerUserId');
+
+      companyById = new Map(companyDocs.map((c) => [String(c._id), c]));
+
+      const extraIds = new Set();
+      for (const c of companyDocs) {
+        if (c.ownerUserId) extraIds.add(String(c.ownerUserId));
+      }
+
+      const sas = await User.find({
+        ...ATTENDANCE_SCOPE_FILTER,
+        systemRole: 'super_admin',
+        companyId: {
+          $in: scopedCompanyIds.map((id) => toObjectId(id)).filter(Boolean),
+        },
+      }).select('_id');
+      sas.forEach((u) => extraIds.add(String(u._id)));
+
+      const have = new Set(users.map((u) => String(u._id)));
+      const missing = [...extraIds].filter((id) => !have.has(id));
+      if (missing.length) {
+        const extras = await User.find({
+          _id: { $in: missing.map((id) => toObjectId(id)).filter(Boolean) },
+          isActive: { $ne: false },
+        }).select(
+          'name role systemRole dept employeeId avatar managerId companyId branchId departmentId teamId status isActive',
+        );
+        users = [...users, ...extras];
+      }
+    } else {
+      const companyIds = [
+        ...new Set(
+          users.map((u) => (u.companyId ? String(u.companyId) : null)).filter(Boolean),
+        ),
+      ];
+      if (companyIds.length) {
+        const docs = await Company.find({
+          _id: { $in: companyIds.map((id) => toObjectId(id)).filter(Boolean) },
+        }).select('_id name slug ownerUserId');
+        docs.forEach((c) => companyById.set(String(c._id), c));
+      }
+    }
+
+    const moreCompanyIds = [
+      ...new Set(
+        users
+          .map((u) => (u.companyId ? String(u.companyId) : null))
+          .filter((id) => id && !companyById.has(id)),
+      ),
+    ];
+    if (moreCompanyIds.length) {
+      const more = await Company.find({
+        _id: { $in: moreCompanyIds.map((id) => toObjectId(id)).filter(Boolean) },
+      }).select('_id name slug ownerUserId');
+      more.forEach((c) => companyById.set(String(c._id), c));
+    }
+
+    const branchIds = [
+      ...new Set(
+        users.map((u) => (u.branchId ? String(u.branchId) : null)).filter(Boolean),
+      ),
+    ];
+    const branches = branchIds.length
+      ? await Branch.find({
+          _id: { $in: branchIds.map((id) => toObjectId(id)).filter(Boolean) },
+        }).select('name code companyId isHeadOffice')
+      : [];
+    const branchById = new Map(branches.map((b) => [String(b._id), b]));
+
+    function toNode(u) {
+      const id = String(u._id);
+      const companyId = u.companyId ? String(u.companyId) : null;
+      const branchId = u.branchId ? String(u.branchId) : null;
+      const branch = branchId ? branchById.get(branchId) : null;
+      return {
+        id,
+        employeeId: u.employeeId || '',
+        name: u.name,
+        role: u.role || ROLE_LABELS_FALLBACK(u.systemRole),
+        systemRole: u.systemRole,
+        dept: u.dept || '',
+        avatar: resolveAvatar(u.avatar, u.name),
+        managerId: u.managerId ? String(u.managerId) : null,
+        companyId,
+        companyName: companyId ? companyById.get(companyId)?.name || '' : '',
+        branchId,
+        branchName: branch?.name || (u.systemRole === 'super_admin' || u.systemRole === 'company_owner' ? 'Company-wide' : ''),
+        branchCode: branch?.code || '',
+        children: [],
+      };
+    }
+
+    function ROLE_LABELS_FALLBACK(systemRole) {
+      const map = {
+        company_owner: 'Company Owner',
+        super_admin: 'Super Admin',
+        branch_head: 'Branch Head',
+        hr: 'HR',
+        manager: 'Manager',
+      };
+      return map[systemRole] || systemRole;
+    }
+
+    const byId = new Map();
+    users.forEach((u) => {
+      byId.set(String(u._id), toNode(u));
+    });
+
+    // Map companyId → owner node id (from Company.ownerUserId)
+    const ownerIdByCompany = new Map();
+    companyById.forEach((c, cid) => {
+      if (c.ownerUserId && byId.has(String(c.ownerUserId))) {
+        ownerIdByCompany.set(cid, String(c.ownerUserId));
+      }
+    });
+
+    // Map companyId → preferred super admin id
+    const saIdByCompany = new Map();
+    byId.forEach((node) => {
+      if (node.systemRole !== 'super_admin' || !node.companyId) return;
+      if (!saIdByCompany.has(node.companyId)) {
+        saIdByCompany.set(node.companyId, node.id);
+      }
+    });
+
+    // Map branchId → branch_head id
+    const bhIdByBranch = new Map();
+    byId.forEach((node) => {
+      if (node.systemRole !== 'branch_head' || !node.branchId) return;
+      if (!bhIdByBranch.has(node.branchId)) {
+        bhIdByBranch.set(node.branchId, node.id);
+      }
+    });
+
+    function structuralParentId(node) {
+      if (node.managerId && byId.has(node.managerId) && node.managerId !== node.id) {
+        return node.managerId;
+      }
+      if (node.systemRole === 'company_owner') return null;
+
+      if (node.systemRole === 'super_admin') {
+        const ownerId = node.companyId
+          ? ownerIdByCompany.get(node.companyId)
+          : null;
+        // Also: owner who owns this company via Company.ownerUserId
+        if (ownerId && ownerId !== node.id) return ownerId;
+        // find any owner in map who owns this company
+        for (const [cid, oid] of ownerIdByCompany) {
+          if (cid === node.companyId && oid !== node.id) return oid;
+        }
+        return null;
+      }
+
+      // Branch head / HR / others → SA of company, else owner
+      if (node.companyId) {
+        if (node.systemRole === 'branch_head' || node.systemRole === 'hr') {
+          const sa = saIdByCompany.get(node.companyId);
+          if (sa && sa !== node.id) return sa;
+          const ownerId = ownerIdByCompany.get(node.companyId);
+          if (ownerId && ownerId !== node.id) return ownerId;
+        }
+        if (
+          ['manager', 'developer', 'sales', 'designer', 'accountant', 'marketing', 'custom'].includes(
+            node.systemRole,
+          ) ||
+          !['company_owner', 'super_admin', 'branch_head', 'hr'].includes(node.systemRole)
+        ) {
+          // Prefer BH of same branch, else SA, else owner
+          if (node.branchId) {
+            const bh = bhIdByBranch.get(node.branchId);
+            if (bh && bh !== node.id) return bh;
+          }
+          const sa = saIdByCompany.get(node.companyId);
+          if (sa && sa !== node.id) return sa;
+          const ownerId = ownerIdByCompany.get(node.companyId);
+          if (ownerId && ownerId !== node.id) return ownerId;
+        }
+      }
+      return null;
+    }
+
+    // Reset children then link
+    byId.forEach((n) => {
+      n.children = [];
+    });
+
+    const parentOf = new Map();
+    byId.forEach((node) => {
+      const pid = structuralParentId(node);
+      if (pid && byId.has(pid)) {
+        parentOf.set(node.id, pid);
+        byId.get(pid).children.push(node);
+      }
+    });
+
+    const roots = [...byId.values()].filter((n) => !parentOf.has(n.id));
+
+    function sortNodes(list) {
+      list.sort((a, b) => {
+        const ra = roleRank(a.systemRole);
+        const rb = roleRank(b.systemRole);
+        if (ra !== rb) return ra - rb;
+        return a.name.localeCompare(b.name);
+      });
+      list.forEach((n) => sortNodes(n.children));
+    }
+    sortNodes(roots);
+
+    // Deep-clone helper for branch slices
+    function cloneWithoutChildren(node) {
+      return {
+        ...node,
+        children: [],
+      };
+    }
+
+    function cloneTree(node) {
+      return {
+        ...node,
+        children: (node.children || []).map(cloneTree),
+      };
+    }
+
+    // Branch view: company leadership (owner/SA) + each branch subtree
+    const branchSections = [];
+    const leadership = [...byId.values()].filter((n) =>
+      ['company_owner', 'super_admin'].includes(n.systemRole),
+    );
+    sortNodes(leadership);
+
+    const byBranch = new Map();
+    byId.forEach((node) => {
+      if (['company_owner', 'super_admin'].includes(node.systemRole)) return;
+      const key = node.branchId || '__unassigned__';
+      if (!byBranch.has(key)) byBranch.set(key, []);
+      byBranch.get(key).push(node);
+    });
+
+    // Build per-branch trees from nodes that belong to the branch (using parent links
+    // only when parent is also in the branch set; otherwise treat as local root)
+    for (const [key, members] of byBranch) {
+      const memberIds = new Set(members.map((m) => m.id));
+      const local = new Map(
+        members.map((m) => [m.id, { ...cloneWithoutChildren(m), children: [] }]),
+      );
+      const localRoots = [];
+      local.forEach((node) => {
+        const pid = parentOf.get(node.id);
+        if (pid && memberIds.has(pid) && local.has(pid)) {
+          local.get(pid).children.push(node);
+        } else {
+          localRoots.push(node);
+        }
+      });
+      sortNodes(localRoots);
+
+      const branch = key !== '__unassigned__' ? branchById.get(key) : null;
+      branchSections.push({
+        id: key,
+        branchId: key === '__unassigned__' ? null : key,
+        name: branch?.name || 'Unassigned / Company-wide staff',
+        code: branch?.code || '',
+        isHeadOffice: Boolean(branch?.isHeadOffice),
+        people: members.length,
+        roots: localRoots,
+      });
+    }
+
+    branchSections.sort((a, b) => {
+      if (a.isHeadOffice !== b.isHeadOffice) return a.isHeadOffice ? -1 : 1;
+      if (!a.branchId) return 1;
+      if (!b.branchId) return -1;
+      return a.name.localeCompare(b.name);
+    });
+
+    return sendSuccess(res, {
+      roots: roots.map(cloneTree),
+      leadership: leadership.map((n) => ({
+        ...cloneWithoutChildren(n),
+        children: [],
+      })),
+      branches: branchSections,
+      people: byId.size,
+      scope: scopeLabel,
+      scopeLabel,
     });
   } catch (err) {
     return sendError(res, err.message, 500);

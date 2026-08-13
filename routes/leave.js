@@ -4,6 +4,7 @@ const { LEAVE_TYPES } = require('../models/LeaveRequest');
 const User = require('../models/User');
 const Company = require('../models/Company');
 const CompanyMembership = require('../models/CompanyMembership');
+const Team = require('../models/Team');
 const { protect } = require('../middleware/auth');
 const { authorize } = require('../middleware/authorize');
 const {
@@ -12,6 +13,7 @@ const {
   hasPermission,
 } = require('../constants/permissions');
 const { toObjectId, canAccessEmployee } = require('../utils/scope');
+const { getUserTeamIdList } = require('../utils/teamMembership');
 const {
   sendSuccess,
   sendError,
@@ -56,6 +58,19 @@ async function resolveCompanyIds(user) {
   return [];
 }
 
+/** Accept YYYY-MM-DD (preferred) or parseable date strings → YYYY-MM-DD */
+function normalizeDateKey(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 function countDays(startDate, endDate) {
   const s = new Date(`${startDate}T00:00:00`);
   const e = new Date(`${endDate}T00:00:00`);
@@ -63,6 +78,49 @@ function countDays(startDate, endDate) {
   const ms = e.getTime() - s.getTime();
   return Math.floor(ms / (24 * 60 * 60 * 1000)) + 1;
 }
+
+function leaveScopeMeta(user) {
+  switch (user.systemRole) {
+    case 'company_owner':
+      return {
+        scope: 'company',
+        scopeLabel: 'All owned companies',
+        isSelfService: false,
+      };
+    case 'super_admin':
+      return {
+        scope: 'company',
+        scopeLabel: 'Company-wide',
+        isSelfService: false,
+      };
+    case 'branch_head':
+      return {
+        scope: 'branch',
+        scopeLabel: 'Your branch',
+        isSelfService: false,
+      };
+    case 'hr':
+      return {
+        scope: 'branch',
+        scopeLabel: 'Your branch (HR)',
+        isSelfService: false,
+      };
+    case 'manager':
+      return {
+        scope: 'team',
+        scopeLabel: 'Your team',
+        isSelfService: false,
+      };
+    default:
+      return {
+        scope: 'self',
+        scopeLabel: 'Personal',
+        isSelfService: true,
+      };
+  }
+}
+
+const APPLY_FOR_OTHERS_ROLES = ['company_owner', 'super_admin', 'branch_head', 'hr'];
 
 function formatDuration(days) {
   if (days === 1) return '1 Day';
@@ -133,13 +191,11 @@ function mapLeave(doc, userMap, opts = {}) {
   };
 }
 
+/**
+ * Role-scoped leave visibility (same pattern as attendance / payslips):
+ * employee → self · manager → team · HR/BH → branch · SA/owner → company
+ */
 async function buildScopeFilter(actor) {
-  const companyIds = await resolveCompanyIds(actor);
-  if (!companyIds.length && !canViewOrgLeave(actor)) {
-    // staff with no company still see own if they have companyId missing
-    return { userId: actor._id };
-  }
-
   if (!canViewOrgLeave(actor)) {
     return {
       userId: actor._id,
@@ -147,35 +203,62 @@ async function buildScopeFilter(actor) {
     };
   }
 
+  const companyIds = await resolveCompanyIds(actor);
   if (!companyIds.length) return null;
 
   const filter = {
     companyId: { $in: companyIds.map((id) => toObjectId(id)).filter(Boolean) },
   };
 
-  if (isBranchScopedRole(actor.systemRole) && actor.branchId) {
+  if (isBranchScopedRole(actor.systemRole)) {
+    if (!actor.branchId) return { userId: actor._id, ...filter };
     filter.branchId = actor.branchId;
-  } else if (isTeamScopedRole(actor.systemRole)) {
-    const teamFilter = { companyId: actor.companyId };
+    return filter;
+  }
+
+  if (actor.systemRole === 'manager' || isTeamScopedRole(actor.systemRole)) {
+    const teamIds = getUserTeamIdList(actor);
+    const managed = await Team.find({
+      managerId: actor._id,
+      ...(actor.companyId ? { companyId: actor.companyId } : {}),
+    }).select('_id');
+    const allTeamIds = [
+      ...new Set([...teamIds.map(String), ...managed.map((t) => String(t._id))]),
+    ]
+      .map((id) => toObjectId(id))
+      .filter(Boolean);
+
     const teamOr = [{ managerId: actor._id }, { _id: actor._id }];
-    if (actor.teamId) {
-      teamOr.push({ teamId: actor.teamId });
-      teamOr.push({ teamIds: actor.teamId });
+    if (allTeamIds.length) {
+      teamOr.push({ teamId: { $in: allTeamIds } });
+      teamOr.push({ teamIds: { $in: allTeamIds } });
     }
-    if (Array.isArray(actor.teamIds)) {
-      for (const tid of actor.teamIds) {
-        teamOr.push({ teamId: tid });
-        teamOr.push({ teamIds: tid });
-      }
-    }
+
     const reportees = await User.find({
-      ...teamFilter,
+      companyId: actor.companyId,
       $or: teamOr,
     }).select('_id');
+
     filter.userId = { $in: reportees.map((u) => u._id) };
+    return filter;
   }
 
   return filter;
+}
+
+/** True if target employee is inside actor's leave apply / view scope */
+async function canApplyLeaveFor(actor, target) {
+  if (!actor || !target) return false;
+  if (String(actor._id) === String(target._id)) return true;
+
+  if (!APPLY_FOR_OTHERS_ROLES.includes(actor.systemRole)) return false;
+
+  if (actor.systemRole === 'company_owner') {
+    const owned = await resolveOwnerCompanyIds(actor);
+    return Boolean(target.companyId && owned.includes(String(target.companyId)));
+  }
+
+  return canAccessEmployee(actor, target);
 }
 
 async function annotateRequests(actor, requests) {
@@ -221,6 +304,7 @@ router.get(
   authorize('view_leave', 'view_own_leave'),
   async (req, res) => {
     try {
+      const scopeMeta = leaveScopeMeta(req.user);
       const filter = await buildScopeFilter(req.user);
       if (!filter) {
         return sendSuccess(res, {
@@ -235,10 +319,10 @@ router.get(
           leaveTypes: LEAVE_TYPES,
           workflow: workflowLabel(),
           canApprove: hasPermission(req.user.systemRole, 'approve_leave'),
-          canApplyForOthers: ['company_owner', 'super_admin', 'branch_head', 'hr'].includes(
-            req.user.systemRole,
-          ),
-          isSelfService: !canViewOrgLeave(req.user),
+          canApplyForOthers: APPLY_FOR_OTHERS_ROLES.includes(req.user.systemRole),
+          isSelfService: scopeMeta.isSelfService,
+          scope: scopeMeta.scope,
+          scopeLabel: scopeMeta.scopeLabel,
         });
       }
 
@@ -246,7 +330,7 @@ router.get(
       const monthStart = new Date(`${prefix}-01T00:00:00.000Z`);
       const yearStart = new Date(`${new Date().getFullYear()}-01-01T00:00:00.000Z`);
 
-      const selfOnly = !canViewOrgLeave(req.user);
+      const selfOnly = scopeMeta.isSelfService;
       const balanceFilter = selfOnly
         ? { userId: req.user._id }
         : filter;
@@ -267,6 +351,7 @@ router.get(
               ...ACTIVE_EMPLOYEE_FILTER,
               companyId: filter.companyId,
               ...(filter.branchId ? { branchId: filter.branchId } : {}),
+              ...(filter.userId ? { _id: filter.userId } : {}),
             }),
       ]);
 
@@ -324,10 +409,10 @@ router.get(
         leaveTypes: LEAVE_TYPES,
         workflow: workflowLabel(),
         canApprove: hasPermission(req.user.systemRole, 'approve_leave'),
-        canApplyForOthers: ['company_owner', 'super_admin', 'branch_head', 'hr'].includes(
-          req.user.systemRole,
-        ),
+        canApplyForOthers: APPLY_FOR_OTHERS_ROLES.includes(req.user.systemRole),
         isSelfService: selfOnly,
+        scope: scopeMeta.scope,
+        scopeLabel: scopeMeta.scopeLabel,
       });
     } catch (err) {
       return sendError(res, err.message, 500);
@@ -358,40 +443,42 @@ router.get('/', protect, authorize('view_leave', 'view_own_leave'), async (req, 
   }
 });
 
-// POST /api/leave — apply (self or for employee if privileged)
+// POST /api/leave — apply (self or for employee if privileged + in scope)
 router.post('/', protect, authorize('apply_leave'), async (req, res) => {
   try {
     const {
       leaveType,
-      startDate,
-      endDate,
+      startDate: startRaw,
+      endDate: endRaw,
       reason,
       days: daysBody,
       userId: targetUserId,
     } = req.body;
 
-    if (!leaveType || !startDate || !endDate) {
+    if (!leaveType || !startRaw || !endRaw) {
       return sendError(res, 'leaveType, startDate and endDate are required');
     }
     if (!LEAVE_TYPES.includes(leaveType)) {
       return sendError(res, `Invalid leaveType. Allowed: ${LEAVE_TYPES.join(', ')}`);
     }
 
+    const startDate = normalizeDateKey(startRaw);
+    const endDate = normalizeDateKey(endRaw);
+    if (!startDate || !endDate) {
+      return sendError(res, 'Dates must be valid (YYYY-MM-DD)');
+    }
+    if (endDate < startDate) {
+      return sendError(res, 'Invalid date range — end date cannot be before start date');
+    }
+
     let target = req.user;
     if (targetUserId && String(targetUserId) !== String(req.user._id)) {
-      if (!['company_owner', 'super_admin', 'branch_head', 'hr'].includes(req.user.systemRole)) {
-        return sendError(res, 'Forbidden — cannot apply leave for another user', 403);
-      }
       target = await User.findById(targetUserId);
       if (!target) return sendError(res, 'Employee not found', 404);
 
-      if (req.user.systemRole === 'company_owner') {
-        const owned = await resolveOwnerCompanyIds(req.user);
-        if (!owned.includes(String(target.companyId))) {
-          return sendError(res, 'Forbidden', 403);
-        }
-      } else if (!canAccessEmployee(req.user, target)) {
-        return sendError(res, 'Forbidden', 403);
+      const allowed = await canApplyLeaveFor(req.user, target);
+      if (!allowed) {
+        return sendError(res, 'Forbidden — employee is outside your role scope', 403);
       }
     }
 
@@ -401,7 +488,7 @@ router.post('/', protect, authorize('apply_leave'), async (req, res) => {
 
     const days = Number(daysBody) > 0 ? Number(daysBody) : countDays(startDate, endDate);
     if (!days || days <= 0) {
-      return sendError(res, 'Invalid date range');
+      return sendError(res, 'Invalid date range — end date cannot be before start date');
     }
 
     const chain = approvalChainForRequester(target.systemRole);
@@ -462,12 +549,24 @@ router.post('/', protect, authorize('apply_leave'), async (req, res) => {
   }
 });
 
+async function leaveInActorScope(actor, leave) {
+  const filter = await buildScopeFilter(actor);
+  if (!filter) return false;
+  const match = await LeaveRequest.findOne({ _id: leave._id, ...filter }).select('_id');
+  return Boolean(match);
+}
+
 async function reviewLeave(req, res, action) {
   try {
     const leave = await LeaveRequest.findById(req.params.id);
     if (!leave) return sendError(res, 'Leave request not found', 404);
     if (leave.status !== 'Pending') {
       return sendError(res, `Cannot ${action} a ${leave.status.toLowerCase()} request`);
+    }
+
+    const inScope = await leaveInActorScope(req.user, leave);
+    if (!inScope) {
+      return sendError(res, 'Forbidden — leave request is outside your role scope', 403);
     }
 
     const requester = await User.findById(leave.userId).select(

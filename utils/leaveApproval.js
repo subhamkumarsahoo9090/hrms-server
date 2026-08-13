@@ -1,5 +1,6 @@
 const Team = require('../models/Team');
-const User = require('../models/User');
+const Company = require('../models/Company');
+const CompanyMembership = require('../models/CompanyMembership');
 const { STAFF_ROLES } = require('../constants/permissions');
 const { getUserTeamIdList } = require('./teamMembership');
 
@@ -54,11 +55,18 @@ async function isTeamManagerOf(actor, employee) {
     managerId: actor._id,
     ...(actor.companyId ? { companyId: actor.companyId } : {}),
   }).select('_id');
-  if (!managedTeams.length) return false;
 
   const managedIds = new Set(managedTeams.map((t) => String(t._id)));
   const empTeams = getUserTeamIdList(employee).map(String);
-  return empTeams.some((id) => managedIds.has(id));
+  if (empTeams.some((id) => managedIds.has(id))) return true;
+
+  // Manager role on the same team as the employee (teamId / teamIds overlap)
+  if (String(actor.systemRole || '') === 'manager') {
+    const actorTeams = new Set(getUserTeamIdList(actor).map(String));
+    if (empTeams.some((id) => actorTeams.has(id))) return true;
+  }
+
+  return false;
 }
 
 /**
@@ -77,13 +85,9 @@ async function canActOnLeaveStage(actor, leave, requester) {
   }
 
   if (stage === 'hr' || stage === 'branch_head') {
-    if (actor.branchId && leave.branchId) {
-      return String(actor.branchId) === String(leave.branchId);
-    }
-    if (actor.companyId && leave.companyId) {
-      return String(actor.companyId) === String(leave.companyId);
-    }
-    return true;
+    // Branch-scoped: only act on leave in the same branch
+    if (!actor.branchId || !leave.branchId) return false;
+    return String(actor.branchId) === String(leave.branchId);
   }
 
   if (stage === 'super_admin') {
@@ -94,7 +98,15 @@ async function canActOnLeaveStage(actor, leave, requester) {
   }
 
   if (stage === 'company_owner') {
-    return actor.systemRole === 'company_owner';
+    if (actor.systemRole !== 'company_owner') return false;
+    const leaveCompanyId = String(leave.companyId || '');
+    if (!leaveCompanyId) return false;
+    if (String(actor.companyId || '') === leaveCompanyId) return true;
+    const [owned, membership] = await Promise.all([
+      Company.findOne({ _id: leave.companyId, ownerUserId: actor._id }).select('_id'),
+      CompanyMembership.findOne({ userId: actor._id, companyId: leave.companyId }).select('_id'),
+    ]);
+    return Boolean(owned || membership);
   }
 
   return false;

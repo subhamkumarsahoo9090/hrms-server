@@ -2,6 +2,7 @@ const AttendanceLog = require('../models/AttendanceLog');
 const ChatMessage = require('../models/ChatMessage');
 const DelayRequest = require('../models/DelayRequest');
 const Email = require('../models/Email');
+const LeaveRequest = require('../models/LeaveRequest');
 const LunchReservation = require('../models/LunchReservation');
 const Menu = require('../models/Menu');
 const Message = require('../models/Message');
@@ -48,10 +49,11 @@ async function buildNotifications(user) {
         id: `attendance:checkin:${today}`,
         type: 'attendance',
         title: 'Check in reminder',
-        message: 'You have not checked in yet today. Tap to open Time & Attendance.',
+        message: 'You have not checked in yet today. Open Attendance to clock in.',
         emoji: '📋',
         time: 'Today',
         actionTab: 'attendance',
+        href: '/attendance',
       });
     } else if (todayLog.timeIn && !todayLog.timeOut) {
       pushItem(items, dismissedSet, {
@@ -62,6 +64,7 @@ async function buildNotifications(user) {
         emoji: '⏰',
         time: formatNotificationTime(todayLog.updatedAt),
         actionTab: 'attendance',
+        href: '/attendance',
       });
     }
   }
@@ -71,16 +74,75 @@ async function buildNotifications(user) {
     read: false,
   });
   if (chatUnread > 0) {
+    const latestChat = await ChatMessage.findOne({
+      receiver: user._id,
+      read: false,
+    })
+      .sort({ createdAt: -1 })
+      .populate('sender', 'name');
     pushItem(items, dismissedSet, {
       id: 'chat:unread',
       type: 'chat',
       title: `${chatUnread} unread chat message${chatUnread > 1 ? 's' : ''}`,
-      message: 'Open Live Chat to read and reply to your conversations.',
+      message: latestChat?.sender?.name
+        ? `Latest from ${latestChat.sender.name}. Open Official Chat to reply.`
+        : 'Open Official Chat to read and reply.',
       emoji: '💬',
-      time: 'Now',
-      actionTab: 'communications',
+      time: latestChat ? formatNotificationTime(latestChat.createdAt) : 'Now',
+      actionTab: 'chat',
+      href: '/chat',
     });
   }
+
+  if (hasPermission(user.systemRole, 'approve_leave')) {
+    const awaitingLeave = await LeaveRequest.find({
+      status: 'Pending',
+      currentApproverRole: user.systemRole,
+      userId: { $ne: user._id },
+    })
+      .sort({ appliedAt: -1 })
+      .limit(20)
+      .populate('userId', 'name employeeId');
+
+    if (awaitingLeave.length > 0) {
+      const names = awaitingLeave
+        .slice(0, 3)
+        .map((l) => l.userId?.name || l.employeeId || 'Employee')
+        .join(', ');
+      pushItem(items, dismissedSet, {
+        id: `leave:awaiting:${user.systemRole}:${awaitingLeave.length}`,
+        type: 'leave',
+        title: `${awaitingLeave.length} leave request${awaitingLeave.length > 1 ? 's' : ''} awaiting you`,
+        message: `${names}${awaitingLeave.length > 3 ? '…' : ''} — open Leave Approvals.`,
+        emoji: '🗓️',
+        time: formatNotificationTime(
+          awaitingLeave[0].appliedAt || awaitingLeave[0].createdAt,
+        ),
+        actionTab: 'leave',
+        href: '/leave/approvals',
+      });
+    }
+  }
+
+  const myPendingLeave = await LeaveRequest.find({
+    userId: user._id,
+    status: 'Pending',
+  })
+    .sort({ appliedAt: -1 })
+    .limit(3);
+
+  myPendingLeave.forEach((leave) => {
+    pushItem(items, dismissedSet, {
+      id: `leave:mine:${leave._id.toString()}`,
+      type: 'leave',
+      title: `${leave.leaveType} still pending`,
+      message: `Awaiting ${leave.currentApproverRole || 'approver'} · ${leave.startDate} → ${leave.endDate}`,
+      emoji: '⏳',
+      time: formatNotificationTime(leave.appliedAt || leave.createdAt),
+      actionTab: 'leave',
+      href: '/leave',
+    });
+  });
 
   const menu = await Menu.findOne({ date: today });
   if (menu?.isLunchActive !== false && menu?.updatedAt) {
@@ -92,15 +154,19 @@ async function buildNotifications(user) {
         title: "Today's lunch menu is ready",
         message: menu.updatedBy
           ? `${menu.updatedBy} updated today's menu. View items in Catering.`
-          : 'See today\'s dishes and pick your lunch preference.',
+          : "See today's dishes and pick your lunch preference.",
         emoji: '🍲',
         time: formatNotificationTime(menu.updatedAt),
         actionTab: 'catering',
+        href: '/catering',
       });
     }
   }
 
-  const myReservation = await LunchReservation.findOne({ userId: user._id, date: today });
+  const myReservation = await LunchReservation.findOne({
+    userId: user._id,
+    date: today,
+  });
   if (menu?.isLunchActive !== false && !myReservation) {
     pushItem(items, dismissedSet, {
       id: `lunch:reservation:${today}`,
@@ -110,6 +176,7 @@ async function buildNotifications(user) {
       emoji: '🥗',
       time: 'Today',
       actionTab: 'catering',
+      href: '/catering',
     });
   }
 
@@ -131,6 +198,7 @@ async function buildNotifications(user) {
       emoji: delay.status === 'Approved' ? '✅' : '❌',
       time: formatNotificationTime(delay.updatedAt),
       actionTab: 'attendance',
+      href: '/attendance',
     });
   });
 
@@ -148,6 +216,7 @@ async function buildNotifications(user) {
       emoji: '⏳',
       time: formatNotificationTime(myPendingDelay.createdAt),
       actionTab: 'attendance',
+      href: '/attendance',
     });
   }
 
@@ -161,13 +230,15 @@ async function buildNotifications(user) {
         id: `delay:pending:team:${today}:${pendingDelays.length}`,
         type: 'delay',
         title: `${pendingDelays.length} delay request${pendingDelays.length > 1 ? 's' : ''} pending`,
-        message: pendingDelays
-          .slice(0, 3)
-          .map((d) => `${d.empName} (${d.dept})`)
-          .join(', ') + (pendingDelays.length > 3 ? '…' : ''),
+        message:
+          pendingDelays
+            .slice(0, 3)
+            .map((d) => `${d.empName} (${d.dept})`)
+            .join(', ') + (pendingDelays.length > 3 ? '…' : ''),
         emoji: '⚠️',
         time: formatNotificationTime(pendingDelays[0].createdAt),
         actionTab: 'attendance',
+        href: '/attendance',
       });
     }
   }
@@ -179,13 +250,15 @@ async function buildNotifications(user) {
         id: `team:absent:${today}:${absentUsers.length}`,
         type: 'team',
         title: `${absentUsers.length} absent today`,
-        message: absentUsers
-          .slice(0, 3)
-          .map((u) => u.name)
-          .join(', ') + (absentUsers.length > 3 ? '…' : ''),
+        message:
+          absentUsers
+            .slice(0, 3)
+            .map((u) => u.name)
+            .join(', ') + (absentUsers.length > 3 ? '…' : ''),
         emoji: '🏠',
         time: 'Today',
         actionTab: 'home',
+        href: '/',
       });
     }
   }
@@ -206,6 +279,7 @@ async function buildNotifications(user) {
       emoji: '📢',
       time: msg.time || formatNotificationTime(msg.createdAt),
       actionTab: 'home',
+      href: '/',
     });
   });
 
@@ -223,6 +297,7 @@ async function buildNotifications(user) {
         emoji: '✉️',
         time: email.time || formatNotificationTime(email.createdAt),
         actionTab: 'home',
+        href: '/',
       });
     });
   }
